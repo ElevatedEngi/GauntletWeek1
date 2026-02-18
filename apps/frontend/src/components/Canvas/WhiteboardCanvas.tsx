@@ -269,6 +269,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       setCanvasState((prev) => ({ ...prev, scale: newScale }));
       // Zoom toward the cursor position so the point under the mouse stays fixed
       canvas.zoomToPoint(new fabric.Point(e.offsetX, e.offsetY), newScale);
+      canvas.requestRenderAll();
       syncCssGrid(canvas.viewportTransform as number[]);
     };
 
@@ -648,6 +649,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
             if (c) {
               c.setZoom(1);
               c.setViewportTransform([1, 0, 0, 1, 0, 0]);
+              c.requestRenderAll();
             }
             if (canvasAreaRef.current) {
               canvasAreaRef.current.style.backgroundSize = `${GRID_SIZE}px ${GRID_SIZE}px`;
