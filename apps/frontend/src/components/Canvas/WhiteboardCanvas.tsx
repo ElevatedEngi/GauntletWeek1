@@ -676,7 +676,6 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         <div
           ref={canvasAreaRef}
           className="w-full h-full"
-          onClick={() => containerRef.current?.focus()}
           style={{
             backgroundColor: '#ffffff',
             backgroundImage:
@@ -839,11 +838,8 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
       canvas.selection = true;
       activeEditingObjectId.current = null;
+      isEditingTextRef.current = false;
       setConfirmButtonPos(null);
-
-      setTimeout(() => {
-        isEditingTextRef.current = false;
-      }, 100);
     });
 
     // Handle object moving — keep text glued to shape locally AND broadcast to other users
@@ -915,7 +911,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       }
     });
 
-    // Handle double-click on shapes to activate text editing
+    // Handle double-click on shapes/textboxes to activate text editing
     canvas.on('mouse:dblclick', (e: fabric.IEvent) => {
       const target = e.target;
       if (!target || !target.data?.objectId) return;
@@ -923,27 +919,31 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const objectId = target.data.objectId as string;
       const targetType = target.data.type as string;
 
-      // If double-clicked on a shape, activate its text for editing
-      if (targetType === 'shape') {
-        // Check if this object is locked by another user
-        const lock = currentLocksRef.current.get(objectId);
-        const currentUser = useAuthStore.getState().user;
-        if (lock && lock.lockedBy !== currentUser?.id) {
-          setLockToastMsg(`${lock.lockedByName} is currently editing this`);
-          setTimeout(() => setLockToastMsg(null), 2500);
-          return;
-        }
+      // Resolve the objectId for lock check — textboxes share their parent shape's objectId
+      const lockObjectId = targetType === 'text'
+        ? (target.data?.parentShapeId as string || objectId)
+        : objectId;
 
-        const textObj = canvas.getObjects().find(
-          (obj) => obj.data?.objectId === objectId && obj.data?.type === 'text'
-        ) as fabric.Textbox;
+      // Check if this object is locked by another user (applies to both shape and text clicks)
+      const lock = currentLocksRef.current.get(lockObjectId);
+      const currentUser = useAuthStore.getState().user;
+      if (lock && lock.lockedBy !== currentUser?.id) {
+        setLockToastMsg(`${lock.lockedByName} is currently editing this`);
+        setTimeout(() => setLockToastMsg(null), 2500);
+        return;
+      }
 
-        if (textObj) {
-          canvas.discardActiveObject();
+      // Find the textbox associated with this object (whether user clicked shape or text)
+      const textObj = canvas.getObjects().find(
+        (obj) => obj.data?.objectId === lockObjectId && obj.data?.type === 'text'
+      ) as fabric.Textbox;
+
+      if (targetType === 'shape' || targetType === 'text') {
+        if (textObj && !(textObj as any).isEditing) {
           canvas.setActiveObject(textObj);
           textObj.enterEditing();
           textObj.selectAll();
-          canvas.renderAll();
+          canvas.requestRenderAll();
         }
       }
     });
