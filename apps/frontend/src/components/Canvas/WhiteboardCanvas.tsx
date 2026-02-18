@@ -195,8 +195,11 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
   // Sync store objects to canvas (but not while editing text)
   useEffect(() => {
-    if (!fabricCanvasRef.current || isEditingTextRef.current) return;
-
+    if (!fabricCanvasRef.current) return;
+    // Per-object guards inside syncObjectsToCanvas protect the specific textbox
+    // being edited (isEditing check) and any actively-dragged shape (isShapeActive).
+    // Removing the global isEditingTextRef guard here lets remote adds/moves/deletes
+    // remain visible to a user who is currently typing.
     syncObjectsToCanvas(fabricCanvasRef.current, Array.from(objects.values()), user?.id || '');
   }, [objects, user?.id]);
 
@@ -951,11 +954,6 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     boardObjects: BoardObject[],
     currentUserId: string
   ) {
-    // Don't clear and re-sync if we're editing text
-    if (isEditingTextRef.current) {
-      return;
-    }
-
     // Build O(1) lookup maps: one for shapes, one for text objects
     const existingObjectIds = new Set<string>();
     const canvasShapeMap = new Map<string, fabric.Object>();
