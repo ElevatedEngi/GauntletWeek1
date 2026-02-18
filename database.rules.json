@@ -1,0 +1,29 @@
+{
+  "rules": {
+    "boards": {
+      "$boardId": {
+        ".read": "auth != null",
+        "objects": {
+          "$objectId": {
+            ".write": "auth != null",
+            ".validate": "newData.hasChildren(['id', 'type', 'position', 'userId'])"
+          }
+        },
+        "cursors": {
+          "$userId": {
+            ".read": "auth != null",
+            ".write": "auth != null && auth.uid == $userId",
+            ".validate": "newData.hasChildren(['position', 'color', 'userName'])"
+          }
+        },
+        "presence": {
+          "$userId": {
+            ".read": "auth != null",
+            ".write": "auth != null && auth.uid == $userId",
+            ".validate": "newData.hasChildren(['userId', 'userName', 'status'])"
+          }
+        }
+      }
+    }
+  }
+}

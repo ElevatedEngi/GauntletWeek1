@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2020"],
+    "paths": {
+      "@/*": ["./src/*"],
+      "@whiteboard/shared-types": ["../../packages/shared-types/src"]
+    },
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/shared-types" }
+  ]
+}

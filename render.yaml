@@ -1,0 +1,31 @@
+# Render.com Blueprint
+# Automatically deploys both frontend and backend
+
+services:
+  # Backend API + WebSocket Server
+  - type: web
+    name: whiteboard-backend
+    runtime: node
+    rootDir: apps/backend
+    buildCommand: npm install
+    startCommand: npm run dev
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: FRONTEND_URL
+        sync: false  # Set manually in Render dashboard
+      - key: JWT_SECRET
+        generateValue: true  # Auto-generate secure secret
+
+  # Frontend Static Site
+  - type: web
+    name: whiteboard-frontend
+    runtime: static
+    rootDir: apps/frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false  # Set to backend URL in Render dashboard

@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "paths": {
+      "@/*": ["./src/*"],
+      "@whiteboard/shared-types": ["../../packages/shared-types/src"]
+    },
+    "outDir": "./dist"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/shared-types" }
+  ]
+}
