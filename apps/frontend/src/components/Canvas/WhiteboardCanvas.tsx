@@ -7,6 +7,7 @@ import { BoardObject, ObjectType } from '@whiteboard/shared-types';
 import useBoardStore from '../../stores/boardStore';
 import useAuthStore from '../../stores/authStore';
 import { viewportRef } from '../../utils/viewportRef';
+import CursorOverlay from './CursorOverlay';
 
 // Debounce helper
 function debounce<T extends (...args: any[]) => any>(
@@ -67,8 +68,8 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   const [confirmButtonPos, setConfirmButtonPos] = useState<{ left: number; top: number } | null>(null);
   const [lockToastMsg, setLockToastMsg] = useState<string | null>(null);
 
-  const { objects, addObject, updateObject: updateObjectStore, deleteObject } = useBoardStore();
-  const { user } = useAuthStore();
+  const { objects, addObject, updateObject: updateObjectStore, deleteObject, isConnected } = useBoardStore();
+  const { user, cursorColor } = useAuthStore();
 
   // Create debounced sync function for text updates to Firebase
   const debouncedTextSync = useRef(
@@ -474,6 +475,43 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [deleteObject, boardId]);
 
+  // Throttled cursor position broadcast to Firebase (30 Hz).
+  // Uses canvasAreaRef (inner Fabric canvas div) — not the outer BoardPage wrapper —
+  // so the rect origin exactly matches the top-left of the Fabric canvas.
+  useEffect(() => {
+    if (!isConnected || !user || !boardId) return;
+
+    const myCursorRef = ref(realtimeDb, `boards/${boardId}/cursors/${user.id}`);
+    let lastSend = 0;
+
+    const throttledMouseMove = (e: MouseEvent) => {
+      const now = Date.now();
+      if (now - lastSend > 33) {
+        const rect = canvasAreaRef.current?.getBoundingClientRect();
+        const vp = viewportRef.current;
+        const areaX = rect ? e.clientX - rect.left : e.clientX;
+        const areaY = rect ? e.clientY - rect.top  : e.clientY;
+        const canvasX = (areaX - vp[4]) / vp[0];
+        const canvasY = (areaY - vp[5]) / vp[3];
+        set(myCursorRef, {
+          position: { x: canvasX, y: canvasY },
+          color: cursorColor,
+          userName: user.name,
+          lastUpdate: now,
+        }).catch(() => {});
+        lastSend = now;
+      }
+    };
+
+    document.addEventListener('mousemove', throttledMouseMove);
+    onDisconnect(myCursorRef).remove();
+
+    return () => {
+      document.removeEventListener('mousemove', throttledMouseMove);
+      remove(myCursorRef);
+    };
+  }, [isConnected, user, boardId, cursorColor]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // createObject: defined as useCallback so it always captures current user/boardId/canvas
   const createObject = useCallback((type: 'sticky_note' | 'rectangle' | 'circle' | 'arrow') => {
     const canvas = fabricCanvasRef.current;
@@ -704,6 +742,9 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
             🔒 {lockToastMsg}
           </div>
         )}
+
+        {/* Remote cursor overlay — rendered here so absolute inset-0 matches Fabric canvas origin */}
+        <CursorOverlay />
       </div>
 
       {/* Controls reference */}

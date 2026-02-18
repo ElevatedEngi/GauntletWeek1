@@ -1,22 +1,20 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ref, onValue, set, onDisconnect, remove } from 'firebase/database';
+import { ref, onValue, set, onDisconnect } from 'firebase/database';
 import { doc, getDoc, updateDoc } from 'firebase/firestore';
 import { realtimeDb, db } from '../../services/firebase';
 import useAuthStore from '../../stores/authStore';
 import useBoardStore from '../../stores/boardStore';
 import WhiteboardCanvas from '../Canvas/WhiteboardCanvas';
-import CursorOverlay from '../Canvas/CursorOverlay';
 import PresenceList from './PresenceList';
 import CursorList from './CursorList';
 import AICommandInput from './AICommandInput';
 import { Board, Cursor, PresenceUser } from '@whiteboard/shared-types';
-import { viewportRef } from '../../utils/viewportRef';
 
 const BoardPage: React.FC = () => {
   const { id: boardId } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { user, logout, cursorColor } = useAuthStore();
+  const { user, logout } = useAuthStore();
   const {
     board,
     setBoard,
@@ -30,8 +28,6 @@ const BoardPage: React.FC = () => {
     addObject,
     deleteObject,
   } = useBoardStore();
-
-  const canvasAreaRef = useRef<HTMLDivElement>(null);
 
   const [showMenu, setShowMenu] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -271,42 +267,6 @@ const BoardPage: React.FC = () => {
     };
   };
 
-  // Throttled cursor position updates to Realtime Database (30 Hz)
-  useEffect(() => {
-    if (!isConnected || !user || !board?.id) return;
-
-    const myCursorRef = ref(realtimeDb, `boards/${board.id}/cursors/${user.id}`);
-
-    let lastSend = 0;
-    const throttledMouseMove = (e: MouseEvent) => {
-      const now = Date.now();
-      if (now - lastSend > 33) {
-        // Convert screen coords → canvas coords so remote users see the cursor
-        // at the correct canvas location regardless of their pan/zoom level.
-        const rect = canvasAreaRef.current?.getBoundingClientRect();
-        const vp = viewportRef.current;
-        const areaX = rect ? e.clientX - rect.left : e.clientX;
-        const areaY = rect ? e.clientY - rect.top  : e.clientY;
-        const canvasX = (areaX - vp[4]) / vp[0];
-        const canvasY = (areaY - vp[5]) / vp[3];
-        set(myCursorRef, {
-          position: { x: canvasX, y: canvasY },
-          color: cursorColor,
-          userName: user.name,
-          lastUpdate: now,
-        }).catch(() => {});
-        lastSend = now;
-      }
-    };
-
-    document.addEventListener('mousemove', throttledMouseMove);
-    onDisconnect(myCursorRef).remove();
-
-    return () => {
-      document.removeEventListener('mousemove', throttledMouseMove);
-      remove(myCursorRef);
-    };
-  }, [isConnected, user, board?.id, cursorColor]);
 
   const isOwner = board?.ownerId === user?.id;
 
@@ -478,9 +438,8 @@ const BoardPage: React.FC = () => {
       {/* Main Content Area */}
       <div className="flex flex-1 min-h-0">
         {/* Canvas Area */}
-        <div ref={canvasAreaRef} className="flex-1 relative bg-white min-w-0">
+        <div className="flex-1 relative bg-white min-w-0">
           <WhiteboardCanvas boardId={board.id} />
-          <CursorOverlay />
         </div>
 
         {/* Right Sidebar */}
