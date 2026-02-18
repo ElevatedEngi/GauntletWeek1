@@ -11,6 +11,7 @@ import PresenceList from './PresenceList';
 import CursorList from './CursorList';
 import AICommandInput from './AICommandInput';
 import { Board, Cursor, PresenceUser } from '@whiteboard/shared-types';
+import { viewportRef } from '../../utils/viewportRef';
 
 const BoardPage: React.FC = () => {
   const { id: boardId } = useParams<{ id: string }>();
@@ -29,6 +30,8 @@ const BoardPage: React.FC = () => {
     addObject,
     deleteObject,
   } = useBoardStore();
+
+  const canvasAreaRef = useRef<HTMLDivElement>(null);
 
   const [showMenu, setShowMenu] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -278,8 +281,16 @@ const BoardPage: React.FC = () => {
     const throttledMouseMove = (e: MouseEvent) => {
       const now = Date.now();
       if (now - lastSend > 33) {
+        // Convert screen coords → canvas coords so remote users see the cursor
+        // at the correct canvas location regardless of their pan/zoom level.
+        const rect = canvasAreaRef.current?.getBoundingClientRect();
+        const vp = viewportRef.current;
+        const areaX = rect ? e.clientX - rect.left : e.clientX;
+        const areaY = rect ? e.clientY - rect.top  : e.clientY;
+        const canvasX = (areaX - vp[4]) / vp[0];
+        const canvasY = (areaY - vp[5]) / vp[3];
         set(myCursorRef, {
-          position: { x: e.clientX, y: e.clientY },
+          position: { x: canvasX, y: canvasY },
           color: cursorColor,
           userName: user.name,
           lastUpdate: now,
@@ -467,7 +478,7 @@ const BoardPage: React.FC = () => {
       {/* Main Content Area */}
       <div className="flex flex-1 min-h-0">
         {/* Canvas Area */}
-        <div className="flex-1 relative bg-white min-w-0">
+        <div ref={canvasAreaRef} className="flex-1 relative bg-white min-w-0">
           <WhiteboardCanvas boardId={board.id} />
           <CursorOverlay />
         </div>

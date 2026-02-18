@@ -6,6 +6,7 @@ import { realtimeDb } from '../../services/firebase';
 import { BoardObject, ObjectType } from '@whiteboard/shared-types';
 import useBoardStore from '../../stores/boardStore';
 import useAuthStore from '../../stores/authStore';
+import { viewportRef } from '../../utils/viewportRef';
 
 // Debounce helper
 function debounce<T extends (...args: any[]) => any>(
@@ -50,7 +51,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   const recentlyCreatedIds = useRef(new Set<string>());
   // Throttle tracker for real-time drag position broadcasts (per objectId)
   const lastMoveSyncRef = useRef<Map<string, number>>(new Map());
-  const MOVE_SYNC_HZ = 20; // 20 broadcasts/sec during drag
+  const MOVE_SYNC_HZ = 30; // 30 broadcasts/sec during drag (~33ms, matches cursor rate)
 
   // Keyboard / Space pan refs — direct viewport mutation, no React state
   const PAN_SPEED = 8;                                          // px per frame at ~60 fps
@@ -91,6 +92,8 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   // Sync the CSS grid position/size with the current Fabric viewport transform.
   // Also updates the live coordinate display. Called on every pan and zoom frame.
   const syncCssGrid = (vp: number[]) => {
+    // Keep singleton up-to-date so cursor broadcast/display can convert coordinates
+    viewportRef.current = vp;
     if (!canvasAreaRef.current) return;
     const scale = vp[0];
     const g = GRID_SIZE * scale;
