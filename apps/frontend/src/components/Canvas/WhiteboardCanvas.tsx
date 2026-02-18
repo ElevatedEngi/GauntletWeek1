@@ -52,6 +52,14 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   const lastMoveSyncRef = useRef<Map<string, number>>(new Map());
   const MOVE_SYNC_HZ = 20; // 20 broadcasts/sec during drag
 
+  // Keyboard / Space pan refs — direct viewport mutation, no React state
+  const PAN_SPEED = 8;                                          // px per frame at ~60 fps
+  const isSpacePanRef    = useRef(false);                       // Space held → pan mode
+  const keysHeldRef      = useRef(new Set<string>());           // currently-held arrow keys
+  const panAnimFrameRef  = useRef<number | null>(null);         // rAF handle
+  const panVelocityRef   = useRef({ x: 0, y: 0 });             // pan delta per frame
+  const coordsDisplayRef = useRef<HTMLSpanElement | null>(null);// live coords DOM node
+
   // Text editing lock state
   const currentLocksRef = useRef<Map<string, { lockedBy: string; lockedByName: string }>>(new Map());
   const activeEditingObjectId = useRef<string | null>(null);
@@ -80,6 +88,21 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     drawStart: null,
   });
 
+  // Sync the CSS grid position/size with the current Fabric viewport transform.
+  // Also updates the live coordinate display. Called on every pan and zoom frame.
+  const syncCssGrid = (vp: number[]) => {
+    if (!canvasAreaRef.current) return;
+    const scale = vp[0];
+    const g = GRID_SIZE * scale;
+    canvasAreaRef.current.style.backgroundPosition =
+      `${((vp[4] % g) + g) % g}px ${((vp[5] % g) + g) % g}px`;
+    canvasAreaRef.current.style.backgroundSize = `${g}px ${g}px`;
+    if (coordsDisplayRef.current) {
+      coordsDisplayRef.current.textContent =
+        `X:${(-vp[4] / scale).toFixed(0)}  Y:${(-vp[5] / scale).toFixed(0)}`;
+    }
+  };
+
   // Initialize Fabric.js canvas
   useEffect(() => {
     if (!canvasAreaRef.current || !containerRef.current) return;
@@ -99,7 +122,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     const fabricCanvas = new fabric.Canvas(canvasEl, {
       width,
       height,
-      backgroundColor: '#ffffff',
+      backgroundColor: 'transparent',
       renderOnAddRemove: false,
       enableRetinaScaling: true,
     });
@@ -108,10 +131,13 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     // Scenario 2: signal buttons are now usable
     setCanvasReady(true);
 
+    // Focus the container so keyboard events (arrow-key pan, Z-zoom) work
+    // immediately without requiring the user to click first.
+    containerRef.current?.focus();
+
     console.log('[Canvas] initialized', { width: fabricCanvas.width, height: fabricCanvas.height });
 
-    // Draw grid background
-    drawGrid(fabricCanvas, GRID_SIZE);
+    // Grid is rendered as CSS background on canvasAreaRef (moves with viewport)
 
     // Setup event listeners ONCE (not on every sync)
     setupCanvasEventListeners(fabricCanvas);
@@ -125,7 +151,6 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const h = canvasArea.clientHeight;
       if (w > 0 && h > 0 && (fabricCanvas.width !== w || fabricCanvas.height !== h)) {
         fabricCanvas.setDimensions({ width: w, height: h });
-        drawGrid(fabricCanvas, GRID_SIZE);
         fabricCanvas.renderAll();
       }
     });
@@ -136,7 +161,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const newWidth = canvasArea.clientWidth;
       const newHeight = canvasArea.clientHeight;
       fabricCanvas.setDimensions({ width: newWidth, height: newHeight });
-      drawGrid(fabricCanvas, GRID_SIZE);
+      fabricCanvas.calcOffset();
     };
 
     window.addEventListener('resize', handleResize);
@@ -239,10 +264,12 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       e.preventDefault();
 
       const zoomDelta = -e.deltaY * 0.001;
-      const newScale = Math.max(0.1, Math.min(5, canvasState.scale + zoomDelta));
+      const newScale = Math.max(0.1, Math.min(5, canvas.getZoom() + zoomDelta));
 
       setCanvasState((prev) => ({ ...prev, scale: newScale }));
-      canvas.setZoom(newScale);
+      // Zoom toward the cursor position so the point under the mouse stays fixed
+      canvas.zoomToPoint(new fabric.Point(e.offsetX, e.offsetY), newScale);
+      syncCssGrid(canvas.viewportTransform as number[]);
     };
 
     document.addEventListener('keydown', handleKeyDown);
@@ -254,7 +281,83 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       document.removeEventListener('keyup', handleKeyUp);
       canvasAreaRef.current?.removeEventListener('wheel', handleWheel);
     };
-  }, [canvasState.scale]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Keyboard panning: Arrow keys (continuous rAF loop) + Space-pan mode ──────
+  useEffect(() => {
+    const PAN_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']);
+
+    const updateVelocity = () => {
+      let x = 0, y = 0;
+      if (keysHeldRef.current.has('ArrowLeft'))  x += PAN_SPEED;
+      if (keysHeldRef.current.has('ArrowRight')) x -= PAN_SPEED;
+      if (keysHeldRef.current.has('ArrowUp'))    y += PAN_SPEED;
+      if (keysHeldRef.current.has('ArrowDown'))  y -= PAN_SPEED;
+      panVelocityRef.current = { x, y };
+    };
+
+    const startLoop = () => {
+      if (panAnimFrameRef.current !== null) return; // already running
+      const tick = () => {
+        const { x, y } = panVelocityRef.current;
+        const canvas = fabricCanvasRef.current;
+        if (canvas && (x !== 0 || y !== 0)) {
+          const vp = [...(canvas.viewportTransform || [1, 0, 0, 1, 0, 0])];
+          vp[4] += x;
+          vp[5] += y;
+          canvas.setViewportTransform(vp as any);
+          canvas.requestRenderAll();
+          syncCssGrid(vp);
+        }
+        panAnimFrameRef.current = requestAnimationFrame(tick);
+      };
+      panAnimFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    const stopLoop = () => {
+      if (panAnimFrameRef.current !== null) {
+        cancelAnimationFrame(panAnimFrameRef.current);
+        panAnimFrameRef.current = null;
+      }
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Never pan while the user is typing inside a Fabric textbox
+      if (isEditingTextRef.current) return;
+      if (e.key === ' ') {
+        isSpacePanRef.current = true;
+        if (canvasAreaRef.current) canvasAreaRef.current.style.cursor = 'grab';
+        return;
+      }
+      if (PAN_KEYS.has(e.key)) {
+        e.preventDefault(); // prevent browser scroll
+        keysHeldRef.current.add(e.key);
+        updateVelocity();
+        startLoop();
+      }
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === ' ') {
+        isSpacePanRef.current = false;
+        if (canvasAreaRef.current) canvasAreaRef.current.style.cursor = '';
+        return;
+      }
+      if (PAN_KEYS.has(e.key)) {
+        keysHeldRef.current.delete(e.key);
+        updateVelocity();
+        if (keysHeldRef.current.size === 0) stopLoop();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('keyup', onKeyUp);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('keyup', onKeyUp);
+      stopLoop();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Handle mouse events for panning and selection
   useEffect(() => {
@@ -267,39 +370,36 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     let lastPanY = 0;
 
     const handleMouseDown = (e: MouseEvent) => {
-      if (e.button === 2) {
-        // Right-click to pan
+      const isRightClick = e.button === 2;
+      const isSpaceLeftClick = e.button === 0 && isSpacePanRef.current;
+      if (isRightClick || isSpaceLeftClick) {
         isPanning = true;
         lastPanX = e.clientX;
         lastPanY = e.clientY;
+        canvasArea.style.cursor = 'grabbing';
         e.preventDefault();
       }
     };
 
     const handleMouseMove = (e: MouseEvent) => {
-      if (isPanning) {
-        const deltaX = e.clientX - lastPanX;
-        const deltaY = e.clientY - lastPanY;
+      if (!isPanning) return;
+      const deltaX = e.clientX - lastPanX;
+      const deltaY = e.clientY - lastPanY;
+      lastPanX = e.clientX;
+      lastPanY = e.clientY;
 
-        setCanvasState((prev) => ({
-          ...prev,
-          offsetX: prev.offsetX + deltaX,
-          offsetY: prev.offsetY + deltaY,
-        }));
-
-        lastPanX = e.clientX;
-        lastPanY = e.clientY;
-
-        // Update viewport
-        const vp = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
-        vp[4] += deltaX;
-        vp[5] += deltaY;
-        canvas.setViewportTransform(vp);
-      }
+      const vp = [...(canvas.viewportTransform || [1, 0, 0, 1, 0, 0])];
+      vp[4] += deltaX;
+      vp[5] += deltaY;
+      canvas.setViewportTransform(vp as any);
+      canvas.requestRenderAll();
+      syncCssGrid(vp);
     };
 
     const handleMouseUp = () => {
+      if (!isPanning) return;
       isPanning = false;
+      canvasArea.style.cursor = isSpacePanRef.current ? 'grab' : '';
     };
 
     canvasArea.addEventListener('mousedown', handleMouseDown);
@@ -379,8 +479,13 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     console.log('[createObject]', type, { canvasW: canvas.width, canvasH: canvas.height });
 
     const randomColor = OBJECT_COLORS[Math.floor(Math.random() * OBJECT_COLORS.length)];
-    const centerX = 200 + Math.random() * 200;
-    const centerY = 200 + Math.random() * 200;
+    // Place object at viewport center in canvas coordinates (pan + zoom aware)
+    const vp   = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
+    const zoom = canvas.getZoom();
+    const viewCenterX = (canvas.width  || 800) / 2;
+    const viewCenterY = (canvas.height || 600) / 2;
+    const centerX = (viewCenterX - vp[4]) / zoom - DEFAULT_OBJECT_WIDTH  / 2 + (Math.random() * 60 - 30);
+    const centerY = (viewCenterY - vp[5]) / zoom - DEFAULT_OBJECT_HEIGHT / 2 + (Math.random() * 60 - 30);
     const textPadding = 15;
 
     const defaultContent =
@@ -483,7 +588,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   }, [user, boardId, addObject]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div ref={containerRef} className="w-full h-full flex flex-col bg-white">
+    <div ref={containerRef} tabIndex={-1} className="w-full h-full flex flex-col bg-white outline-none">
       {/* Toolbar */}
       <div className="flex items-center gap-2 p-4 border-b border-gray-200 bg-gray-50">
         <button
@@ -524,15 +629,31 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
         <div className="flex-1" />
 
-        <div className="text-sm text-gray-600">
+        {/* Live canvas coordinates — updated via DOM ref (no React re-render) */}
+        <span
+          ref={coordsDisplayRef}
+          className="text-xs text-gray-400 font-mono w-28 text-right select-none"
+        >
+          X:0  Y:0
+        </span>
+
+        <div className="text-sm text-gray-600 ml-2">
           Zoom: {(canvasState.scale * 100).toFixed(0)}%
         </div>
 
         <button
           onClick={() => {
             setCanvasState((prev) => ({ ...prev, scale: 1, offsetX: 0, offsetY: 0 }));
-            fabricCanvasRef.current?.setZoom(1);
-            fabricCanvasRef.current?.setViewportTransform([1, 0, 0, 1, 0, 0]);
+            const c = fabricCanvasRef.current;
+            if (c) {
+              c.setZoom(1);
+              c.setViewportTransform([1, 0, 0, 1, 0, 0]);
+            }
+            if (canvasAreaRef.current) {
+              canvasAreaRef.current.style.backgroundSize = `${GRID_SIZE}px ${GRID_SIZE}px`;
+              canvasAreaRef.current.style.backgroundPosition = '0px 0px';
+            }
+            if (coordsDisplayRef.current) coordsDisplayRef.current.textContent = 'X:0  Y:0';
           }}
           className="px-3 py-2 bg-gray-200 text-gray-900 rounded hover:bg-gray-300 transition text-sm font-medium"
         >
@@ -546,7 +667,16 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       <div className="flex-1 relative overflow-hidden">
         <div
           ref={canvasAreaRef}
-          className="w-full h-full cursor-grab active:cursor-grabbing"
+          className="w-full h-full"
+          onClick={() => containerRef.current?.focus()}
+          style={{
+            backgroundColor: '#ffffff',
+            backgroundImage:
+              `linear-gradient(#e5e7eb 1px, transparent 1px),
+               linear-gradient(90deg, #e5e7eb 1px, transparent 1px)`,
+            backgroundSize: `${GRID_SIZE}px ${GRID_SIZE}px`,
+            backgroundPosition: '0px 0px',
+          }}
         />
 
         {/* ✓ Confirm button — appears next to the text being edited */}
@@ -569,11 +699,14 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         )}
       </div>
 
-      {/* Keyboard hint */}
-      <div className="absolute bottom-4 left-4 text-xs text-gray-500 bg-white px-3 py-2 rounded border border-gray-200">
-        <p>🖱️ Right-click + drag to pan</p>
-        <p>🔍 Hold Z + scroll to zoom</p>
-        <p>Delete or Backspace to remove</p>
+      {/* Controls reference */}
+      <div className="absolute bottom-4 left-4 text-xs text-gray-500 bg-white/90 backdrop-blur-sm px-3 py-2 rounded-lg border border-gray-200 shadow-sm leading-5 select-none">
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">↑ ↓ ← →</kbd> Pan canvas</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Space</kbd> + drag to pan</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Right-click</kbd> + drag to pan</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Z</kbd> + scroll to zoom</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Del</kbd> / <kbd className="font-mono bg-gray-100 px-1 rounded">Backspace</kbd> to remove</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Dbl-click</kbd> shape to edit text</p>
       </div>
     </div>
   );
@@ -807,40 +940,6 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       }
     });
   }
-
-  function drawGrid(canvas: fabric.Canvas, gridSize: number) {
-    // Create grid pattern
-    const bgCanvas = document.createElement('canvas');
-    bgCanvas.width = gridSize;
-    bgCanvas.height = gridSize;
-
-    const ctx = bgCanvas.getContext('2d');
-    if (!ctx) return;
-
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, gridSize, gridSize);
-
-    ctx.strokeStyle = '#e5e7eb';
-    ctx.lineWidth = 0.5;
-
-    ctx.beginPath();
-    ctx.moveTo(gridSize, 0);
-    ctx.lineTo(gridSize, gridSize);
-    ctx.stroke();
-
-    ctx.beginPath();
-    ctx.moveTo(0, gridSize);
-    ctx.lineTo(gridSize, gridSize);
-    ctx.stroke();
-
-    const pattern = ctx.createPattern(bgCanvas, 'repeat');
-    if (pattern) {
-      (canvas as any).backgroundColor = pattern;
-    }
-
-    canvas.renderAll();
-  }
-
 
   function syncObjectsToCanvas(
     canvas: fabric.Canvas,
