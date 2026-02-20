@@ -7,6 +7,7 @@ import { BoardObject, ObjectType } from '@whiteboard/shared-types';
 import useBoardStore from '../../stores/boardStore';
 import useAuthStore from '../../stores/authStore';
 import { viewportRef } from '../../utils/viewportRef';
+import { rectEdgeIntersection, circleEdgeIntersection } from '../../utils/edgeIntersection';
 import CursorOverlay from './CursorOverlay';
 
 // Debounce helper
@@ -68,6 +69,16 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   const [confirmButtonPos, setConfirmButtonPos] = useState<{ left: number; top: number } | null>(null);
   const [lockToastMsg, setLockToastMsg] = useState<string | null>(null);
 
+  // ── Connector state ──────────────────────────────────────────────────────────
+  // Index: objectId → set of connectorIds that reference it (rebuilt each sync)
+  const connectorIndexRef = useRef<Map<string, Set<string>>>(new Map());
+  // Connection mode: user is clicking objects to create a connector
+  const [isConnecting, setIsConnecting] = useState(false);
+  const connectionSourceRef = useRef<string | null>(null);
+  const connectionStyleRef = useRef<'line' | 'arrow'>('arrow');
+  const rubberBandLineRef = useRef<fabric.Line | null>(null);
+  const sourceHighlightRef = useRef<fabric.Object | null>(null);
+
   const { objects, addObject, updateObject: updateObjectStore, deleteObject, isConnected } = useBoardStore();
   const { user, cursorColor } = useAuthStore();
 
@@ -106,6 +117,93 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         `X:${(-vp[4] / scale).toFixed(0)}  Y:${(-vp[5] / scale).toFixed(0)}`;
     }
   };
+
+  // ── Helper: compute connector line endpoints from source/target objects ───────
+  function getConnectorEndpoints(
+    canvas: fabric.Canvas,
+    connObj: BoardObject,
+  ): { x1: number; y1: number; x2: number; y2: number; angle: number } | null {
+    const store = useBoardStore.getState();
+    const srcData = store.objects.get(connObj.sourceObjectId || '');
+    const tgtData = store.objects.get(connObj.targetObjectId || '');
+    if (!srcData || !tgtData) return null;
+
+    // Prefer live Fabric positions (accurate during drag)
+    const srcShape = canvas.getObjects().find(
+      (o) => o.data?.objectId === srcData.id && o.data?.type === 'shape'
+    );
+    const tgtShape = canvas.getObjects().find(
+      (o) => o.data?.objectId === tgtData.id && o.data?.type === 'shape'
+    );
+
+    const sx = srcShape?.left ?? srcData.position.x;
+    const sy = srcShape?.top ?? srcData.position.y;
+    const tx = tgtShape?.left ?? tgtData.position.x;
+    const ty = tgtShape?.top ?? tgtData.position.y;
+
+    const srcCenter = { x: sx + srcData.width / 2, y: sy + srcData.height / 2 };
+    const tgtCenter = { x: tx + tgtData.width / 2, y: ty + tgtData.height / 2 };
+
+    let srcEdge: { x: number; y: number };
+    let tgtEdge: { x: number; y: number };
+
+    if (srcData.type === ObjectType.CIRCLE) {
+      const r = Math.min(srcData.width, srcData.height) / 2;
+      srcEdge = circleEdgeIntersection(srcCenter.x, srcCenter.y, r, tgtCenter.x, tgtCenter.y);
+    } else {
+      srcEdge = rectEdgeIntersection(
+        { x: sx, y: sy, width: srcData.width, height: srcData.height },
+        tgtCenter.x, tgtCenter.y,
+      );
+    }
+
+    if (tgtData.type === ObjectType.CIRCLE) {
+      const r = Math.min(tgtData.width, tgtData.height) / 2;
+      tgtEdge = circleEdgeIntersection(tgtCenter.x, tgtCenter.y, r, srcCenter.x, srcCenter.y);
+    } else {
+      tgtEdge = rectEdgeIntersection(
+        { x: tx, y: ty, width: tgtData.width, height: tgtData.height },
+        srcCenter.x, srcCenter.y,
+      );
+    }
+
+    const angle = Math.atan2(tgtEdge.y - srcEdge.y, tgtEdge.x - srcEdge.x);
+    return { x1: srcEdge.x, y1: srcEdge.y, x2: tgtEdge.x, y2: tgtEdge.y, angle };
+  }
+
+  // ── Helper: update a single connector's Fabric objects on canvas ─────────────
+  function updateConnectorOnCanvas(canvas: fabric.Canvas, connectorId: string) {
+    const store = useBoardStore.getState();
+    const connObj = store.objects.get(connectorId);
+    if (!connObj || connObj.type !== ObjectType.CONNECTOR) return;
+
+    const ep = getConnectorEndpoints(canvas, connObj);
+    if (!ep) return;
+
+    // Update connector line
+    const lineObj = canvas.getObjects().find(
+      (o) => o.data?.objectId === connectorId && o.data?.type === 'connector'
+    ) as fabric.Line | undefined;
+
+    if (lineObj) {
+      lineObj.set({ x1: ep.x1, y1: ep.y1, x2: ep.x2, y2: ep.y2 });
+      lineObj.setCoords();
+    }
+
+    // Update arrowhead
+    const arrowHead = canvas.getObjects().find(
+      (o) => o.data?.objectId === connectorId && o.data?.type === 'arrowhead'
+    ) as fabric.Triangle | undefined;
+
+    if (arrowHead) {
+      arrowHead.set({
+        left: ep.x2,
+        top: ep.y2,
+        angle: (ep.angle * 180 / Math.PI) + 90,
+      });
+      arrowHead.setCoords();
+    }
+  }
 
   // Initialize Fabric.js canvas
   useEffect(() => {
@@ -184,6 +282,8 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       fabricCanvas.off('object:moving');
       fabricCanvas.off('object:scaling');
       fabricCanvas.off('mouse:dblclick');
+      fabricCanvas.off('mouse:down');
+      fabricCanvas.off('mouse:move');
       fabricCanvas.dispose();
     };
   }, []);
@@ -422,13 +522,19 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     };
   }, []);
 
-  // Handle keyboard events for object deletion
+  // Handle keyboard events for object deletion (with connector cascade)
   useEffect(() => {
     if (!fabricCanvasRef.current) return;
 
     const canvas = fabricCanvasRef.current;
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Escape cancels connection mode
+      if (e.key === 'Escape' && isConnecting) {
+        cancelConnectionMode(canvas);
+        return;
+      }
+
       // Don't delete if we're editing text
       if (isEditingTextRef.current) return;
 
@@ -445,6 +551,22 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
         if (target.data?.objectId) {
           const objectId = target.data.objectId as string;
+          const dataType = target.data.type as string;
+
+          // If deleting a shape, cascade-delete all attached connectors
+          if (dataType === 'shape') {
+            const attachedConnectors = connectorIndexRef.current.get(objectId);
+            if (attachedConnectors) {
+              attachedConnectors.forEach((connId) => {
+                deleteObject(connId);
+                const connRef = ref(realtimeDb, `boards/${boardId}/objects/${connId}`);
+                remove(connRef).catch(console.error);
+                canvas.getObjects()
+                  .filter((o) => o.data?.objectId === connId)
+                  .forEach((o) => canvas.remove(o));
+              });
+            }
+          }
 
           // Delete from local store
           deleteObject(objectId);
@@ -455,7 +577,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
             console.error('Failed to delete object from Firebase:', error);
           });
 
-          // Remove both shape and text if they exist
+          // Remove all canvas items for this object (shape+text, or connector+arrowhead)
           const objectsToRemove = canvas.getObjects().filter(
             (obj) => obj.data?.objectId === objectId
           );
@@ -473,7 +595,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [deleteObject, boardId]);
+  }, [deleteObject, boardId, isConnecting]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Throttled cursor position broadcast to Firebase (30 Hz).
   // Uses canvasAreaRef (inner Fabric canvas div) — not the outer BoardPage wrapper —
@@ -632,6 +754,179 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     });
   }, [user, boardId, addObject]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Create a connector between two objects ────────────────────────────────────
+  const createConnector = useCallback((
+    sourceId: string,
+    targetId: string,
+    style: 'line' | 'arrow',
+  ) => {
+    if (!user) return;
+    const connId = uuidv4();
+    const connObject: BoardObject = {
+      id: connId,
+      type: ObjectType.CONNECTOR,
+      position: { x: 0, y: 0 },
+      width: 0,
+      height: 0,
+      rotation: 0,
+      content: '',
+      color: '#6b7280',
+      userId: user.id,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sourceObjectId: sourceId,
+      targetObjectId: targetId,
+      connectorStyle: style,
+    };
+
+    recentlyCreatedIds.current.add(connId);
+    setTimeout(() => recentlyCreatedIds.current.delete(connId), 2000);
+
+    addObject(connObject);
+    const objRef = ref(realtimeDb, `boards/${boardId}/objects/${connId}`);
+    set(objRef, connObject).catch((err) => {
+      console.error('Failed to write connector to Firebase:', err);
+    });
+  }, [user, boardId, addObject]);
+
+  // ── Cancel connection mode ────────────────────────────────────────────────────
+  const cancelConnectionMode = useCallback((canvas: fabric.Canvas) => {
+    setIsConnecting(false);
+    connectionSourceRef.current = null;
+    if (rubberBandLineRef.current) {
+      canvas.remove(rubberBandLineRef.current);
+      rubberBandLineRef.current = null;
+    }
+    if (sourceHighlightRef.current) {
+      sourceHighlightRef.current.set({ stroke: sourceHighlightRef.current.data?._origStroke || '#6b7280' });
+      sourceHighlightRef.current = null;
+    }
+    canvas.defaultCursor = 'default';
+    canvas.renderAll();
+  }, []);
+
+  // ── Start connection mode from toolbar ────────────────────────────────────────
+  const startConnectionMode = useCallback((style: 'line' | 'arrow') => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+
+    // If already connecting, cancel first
+    if (isConnecting) {
+      cancelConnectionMode(canvas);
+      return;
+    }
+
+    connectionStyleRef.current = style;
+    connectionSourceRef.current = null;
+    setIsConnecting(true);
+    canvas.defaultCursor = 'crosshair';
+    canvas.discardActiveObject();
+    canvas.renderAll();
+  }, [isConnecting, cancelConnectionMode]);
+
+  // ── Connection mode: Fabric event handlers ────────────────────────────────────
+  useEffect(() => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+
+    const handleMouseDown = (opt: fabric.IEvent) => {
+      if (!isConnecting) return;
+
+      const target = opt.target;
+
+      // Find the shape objectId under click
+      let clickedObjectId: string | null = null;
+      if (target?.data?.objectId && (target.data.type === 'shape' || target.data.type === 'text')) {
+        clickedObjectId = target.data.objectId as string;
+      }
+
+      if (!connectionSourceRef.current) {
+        // First click — select source
+        if (!clickedObjectId) {
+          cancelConnectionMode(canvas);
+          return;
+        }
+
+        // Don't allow connecting from connectors
+        const obj = useBoardStore.getState().objects.get(clickedObjectId);
+        if (!obj || obj.type === ObjectType.CONNECTOR) return;
+
+        connectionSourceRef.current = clickedObjectId;
+
+        // Highlight the source shape
+        const shapeObj = canvas.getObjects().find(
+          (o) => o.data?.objectId === clickedObjectId && o.data?.type === 'shape'
+        );
+        if (shapeObj) {
+          shapeObj.data._origStroke = shapeObj.stroke;
+          shapeObj.set({ stroke: '#3b82f6' });
+          sourceHighlightRef.current = shapeObj;
+        }
+
+        canvas.renderAll();
+      } else {
+        // Second click — select target and create connector
+        if (!clickedObjectId || clickedObjectId === connectionSourceRef.current) {
+          cancelConnectionMode(canvas);
+          return;
+        }
+
+        const obj = useBoardStore.getState().objects.get(clickedObjectId);
+        if (!obj || obj.type === ObjectType.CONNECTOR) {
+          cancelConnectionMode(canvas);
+          return;
+        }
+
+        createConnector(connectionSourceRef.current, clickedObjectId, connectionStyleRef.current);
+        cancelConnectionMode(canvas);
+      }
+    };
+
+    const handleMouseMove = (opt: fabric.IEvent) => {
+      if (!isConnecting || !connectionSourceRef.current) return;
+
+      const pointer = canvas.getPointer(opt.e);
+      const sourceId = connectionSourceRef.current;
+      const store = useBoardStore.getState();
+      const srcData = store.objects.get(sourceId);
+      if (!srcData) return;
+
+      const srcShape = canvas.getObjects().find(
+        (o) => o.data?.objectId === sourceId && o.data?.type === 'shape'
+      );
+      const sx = srcShape?.left ?? srcData.position.x;
+      const sy = srcShape?.top ?? srcData.position.y;
+      const cx = sx + srcData.width / 2;
+      const cy = sy + srcData.height / 2;
+
+      if (!rubberBandLineRef.current) {
+        const line = new fabric.Line([cx, cy, pointer.x, pointer.y], {
+          stroke: '#3b82f6',
+          strokeWidth: 2,
+          strokeDashArray: [6, 4],
+          selectable: false,
+          evented: false,
+          excludeFromExport: true,
+        });
+        rubberBandLineRef.current = line;
+        canvas.add(line);
+      } else {
+        rubberBandLineRef.current.set({ x1: cx, y1: cy, x2: pointer.x, y2: pointer.y });
+        rubberBandLineRef.current.setCoords();
+      }
+
+      canvas.renderAll();
+    };
+
+    canvas.on('mouse:down', handleMouseDown);
+    canvas.on('mouse:move', handleMouseMove);
+
+    return () => {
+      canvas.off('mouse:down', handleMouseDown);
+      canvas.off('mouse:move', handleMouseMove);
+    };
+  }, [isConnecting, createConnector, cancelConnectionMode]);
+
   return (
     <div ref={containerRef} tabIndex={-1} className="w-full h-full flex flex-col bg-white outline-none">
       {/* Toolbar */}
@@ -672,6 +967,36 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           ➜ Arrow
         </button>
 
+        {/* Separator */}
+        <div className="w-px h-6 bg-gray-300 mx-1" />
+
+        {/* Connect buttons */}
+        <button
+          onClick={() => startConnectionMode('line')}
+          disabled={!canvasReady}
+          className={`px-3 py-2 rounded transition text-sm font-medium ${
+            isConnecting && connectionStyleRef.current === 'line'
+              ? 'bg-orange-500 text-white'
+              : 'bg-orange-200 text-gray-900 hover:bg-orange-300'
+          } disabled:opacity-40 disabled:cursor-not-allowed`}
+          title="Connect two objects with a line"
+        >
+          ─ Line
+        </button>
+
+        <button
+          onClick={() => startConnectionMode('arrow')}
+          disabled={!canvasReady}
+          className={`px-3 py-2 rounded transition text-sm font-medium ${
+            isConnecting && connectionStyleRef.current === 'arrow'
+              ? 'bg-orange-500 text-white'
+              : 'bg-orange-200 text-gray-900 hover:bg-orange-300'
+          } disabled:opacity-40 disabled:cursor-not-allowed`}
+          title="Connect two objects with an arrow"
+        >
+          → Arrow
+        </button>
+
         <div className="flex-1" />
 
         {/* Live canvas coordinates — updated via DOM ref (no React re-render) */}
@@ -706,6 +1031,21 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           Reset View
         </button>
       </div>
+
+      {/* Connection mode banner */}
+      {isConnecting && (
+        <div className="bg-orange-50 border-b border-orange-200 px-4 py-1.5 text-sm text-orange-700 flex items-center gap-2">
+          <span className="font-medium">
+            {connectionSourceRef.current ? 'Click a target object to complete the connection' : 'Click a source object to start connecting'}
+          </span>
+          <button
+            onClick={() => fabricCanvasRef.current && cancelConnectionMode(fabricCanvasRef.current)}
+            className="ml-auto text-xs px-2 py-0.5 bg-orange-200 rounded hover:bg-orange-300 transition"
+          >
+            Cancel (Esc)
+          </button>
+        </div>
+      )}
 
       {/* Canvas area — React renders an empty div here.
           The actual <canvas> element is created imperatively in useEffect
@@ -804,6 +1144,12 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         update(objectRef, updates).catch((error) => {
           console.error('Failed to update object in Firebase:', error);
         });
+
+        // Update all connectors attached to this object
+        const attachedConnectors = connectorIndexRef.current.get(objectId);
+        if (attachedConnectors) {
+          attachedConnectors.forEach((connId) => updateConnectorOnCanvas(canvas, connId));
+        }
 
         canvas.renderAll();
       }
@@ -905,6 +1251,12 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           textObj.setCoords();
         }
 
+        // Update all connectors attached to this object in real-time
+        const attachedConnectors = connectorIndexRef.current.get(objectId);
+        if (attachedConnectors) {
+          attachedConnectors.forEach((connId) => updateConnectorOnCanvas(canvas, connId));
+        }
+
         // Throttled broadcast to Firebase so remote users see live movement
         const now = Date.now();
         const last = lastMoveSyncRef.current.get(objectId) || 0;
@@ -995,10 +1347,11 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     boardObjects: BoardObject[],
     currentUserId: string
   ) {
-    // Build O(1) lookup maps: one for shapes, one for text objects
+    // Build O(1) lookup maps
     const existingObjectIds = new Set<string>();
     const canvasShapeMap = new Map<string, fabric.Object>();
     const canvasTextMap = new Map<string, fabric.Textbox>();
+    const canvasConnectorMap = new Map<string, fabric.Line>();
 
     canvas.getObjects().forEach((obj: fabric.Object) => {
       const objectId = obj.data?.objectId as string;
@@ -1006,10 +1359,19 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       existingObjectIds.add(objectId);
       if (obj.data?.type === 'shape') canvasShapeMap.set(objectId, obj);
       else if (obj.data?.type === 'text') canvasTextMap.set(objectId, obj as fabric.Textbox);
+      else if (obj.data?.type === 'connector') canvasConnectorMap.set(objectId, obj as fabric.Line);
     });
 
     // Get board object IDs
     const boardObjectIds = new Set(boardObjects.map(obj => obj.id));
+
+    // Separate shapes/etc from connectors for two-pass rendering
+    const shapeObjects: BoardObject[] = [];
+    const connectorObjects: BoardObject[] = [];
+    boardObjects.forEach((obj) => {
+      if (obj.type === ObjectType.CONNECTOR) connectorObjects.push(obj);
+      else shapeObjects.push(obj);
+    });
 
     // Remove objects that no longer exist in the board
     canvas.getObjects().forEach((obj: fabric.Object) => {
@@ -1025,9 +1387,9 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       }
     });
 
-    // Add or update objects from store
-    boardObjects.forEach((obj) => {
-      // Object already on canvas — update position and text from remote data (O(1) map lookup)
+    // ── Pass 1: Shapes ──────────────────────────────────────────────────────
+    shapeObjects.forEach((obj) => {
+      // Object already on canvas — update position and text from remote data
       if (existingObjectIds.has(obj.id)) {
         const textPadding = 15;
         const activeObj = canvas.getActiveObject();
@@ -1101,13 +1463,13 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
         // Arrow pointing right
         const arrowPoints = [
-          { x: 0, y: (arrowHeight - shaftHeight) / 2 }, // Top left of shaft
-          { x: arrowWidth - headWidth, y: (arrowHeight - shaftHeight) / 2 }, // Top of shaft before head
-          { x: arrowWidth - headWidth, y: 0 }, // Top of arrowhead
-          { x: arrowWidth, y: arrowHeight / 2 }, // Point of arrow
-          { x: arrowWidth - headWidth, y: arrowHeight }, // Bottom of arrowhead
-          { x: arrowWidth - headWidth, y: (arrowHeight + shaftHeight) / 2 }, // Bottom of shaft before head
-          { x: 0, y: (arrowHeight + shaftHeight) / 2 }, // Bottom left of shaft
+          { x: 0, y: (arrowHeight - shaftHeight) / 2 },
+          { x: arrowWidth - headWidth, y: (arrowHeight - shaftHeight) / 2 },
+          { x: arrowWidth - headWidth, y: 0 },
+          { x: arrowWidth, y: arrowHeight / 2 },
+          { x: arrowWidth - headWidth, y: arrowHeight },
+          { x: arrowWidth - headWidth, y: (arrowHeight + shaftHeight) / 2 },
+          { x: 0, y: (arrowHeight + shaftHeight) / 2 },
         ];
 
         shapeObj = new fabric.Polygon(arrowPoints, {
@@ -1169,6 +1531,84 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           }
         });
         canvas.add(text);
+      }
+    });
+
+    // ── Pass 2: Connectors (after shapes so endpoint positions are available) ──
+    // Rebuild connector index
+    const newIndex = new Map<string, Set<string>>();
+    connectorObjects.forEach((conn) => {
+      if (conn.sourceObjectId && conn.targetObjectId) {
+        if (!newIndex.has(conn.sourceObjectId)) newIndex.set(conn.sourceObjectId, new Set());
+        if (!newIndex.has(conn.targetObjectId)) newIndex.set(conn.targetObjectId, new Set());
+        newIndex.get(conn.sourceObjectId)!.add(conn.id);
+        newIndex.get(conn.targetObjectId)!.add(conn.id);
+      }
+    });
+    connectorIndexRef.current = newIndex;
+
+    connectorObjects.forEach((conn) => {
+      // Orphan cleanup: if source or target is gone, delete the connector
+      if (!boardObjectIds.has(conn.sourceObjectId || '') || !boardObjectIds.has(conn.targetObjectId || '')) {
+        deleteObject(conn.id);
+        const connRef = ref(realtimeDb, `boards/${boardId}/objects/${conn.id}`);
+        remove(connRef).catch(console.error);
+        canvas.getObjects()
+          .filter((o) => o.data?.objectId === conn.id)
+          .forEach((o) => canvas.remove(o));
+        return;
+      }
+
+      // Existing connector — update endpoints
+      if (existingObjectIds.has(conn.id)) {
+        updateConnectorOnCanvas(canvas, conn.id);
+        return;
+      }
+
+      // New connector — create line + optional arrowhead
+      const ep = getConnectorEndpoints(canvas, conn);
+      if (!ep) return;
+
+      const line = new fabric.Line([ep.x1, ep.y1, ep.x2, ep.y2], {
+        stroke: conn.color || '#6b7280',
+        strokeWidth: 2,
+        selectable: true,
+        hasControls: false,
+        lockMovementX: true,
+        lockMovementY: true,
+        lockRotation: true,
+        evented: true,
+        perPixelTargetFind: true,
+      });
+      line.set({
+        data: {
+          objectId: conn.id,
+          type: 'connector',
+          sourceObjectId: conn.sourceObjectId,
+          targetObjectId: conn.targetObjectId,
+        },
+      });
+      canvas.add(line);
+      canvas.sendToBack(line);
+
+      if (conn.connectorStyle === 'arrow') {
+        const arrowHead = new fabric.Triangle({
+          left: ep.x2,
+          top: ep.y2,
+          width: 12,
+          height: 12,
+          fill: conn.color || '#6b7280',
+          angle: (ep.angle * 180 / Math.PI) + 90,
+          originX: 'center',
+          originY: 'center',
+          selectable: false,
+          evented: false,
+        });
+        arrowHead.set({
+          data: { objectId: conn.id, type: 'arrowhead' },
+        });
+        canvas.add(arrowHead);
+        canvas.sendToBack(arrowHead);
       }
     });
 

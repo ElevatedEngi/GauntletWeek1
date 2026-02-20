@@ -6,6 +6,7 @@ export enum ObjectType {
   CIRCLE = 'circle',
   LINE = 'line',
   ARROW = 'arrow',
+  CONNECTOR = 'connector',
 }
 
 export interface Position {
@@ -25,6 +26,11 @@ export interface BoardObject {
   userId: string;
   createdAt: number;
   updatedAt: number;
+
+  // Connector-specific fields (only present when type === CONNECTOR)
+  sourceObjectId?: string;
+  targetObjectId?: string;
+  connectorStyle?: 'line' | 'arrow';
 }
 
 export interface User {
