@@ -61,13 +61,19 @@ const AICommandInput: React.FC<AICommandInputProps> = ({ boardId }) => {
         boardObjects[id] = obj;
       });
 
-      const token = await auth.currentUser?.getIdToken() ?? null;
+      if (!auth.currentUser) {
+        setResult('Error: You must be signed in to use AI commands');
+        setIsLoading(false);
+        return;
+      }
+
+      const token = await auth.currentUser.getIdToken();
       const apiUrl = import.meta.env.VITE_API_URL || '';
       const response = await fetch(`${apiUrl}/api/ai/execute-command`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ command, boardId, boardObjects }),
       });

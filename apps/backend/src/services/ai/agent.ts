@@ -5,7 +5,6 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { CallbackHandler } from '@langfuse/langchain';
 import { createWhiteboardTools } from './tools.js';
 import type { ToolAction, PendingOperation } from './tools.js';
 import type { BoardObject } from '@whiteboard/shared-types';
@@ -82,19 +81,30 @@ export class AIAgent {
         new HumanMessage(command),
       ];
 
-      const langfuseHandler = new CallbackHandler({
-        sessionId: boardId,
-        userId,
-        metadata: { command },
-        tags: ['whiteboard-command'],
-      });
+      // Langfuse tracing is optional — only enable if keys are configured
+      const callbacks: any[] = [];
+      let langfuseHandler: any = null;
+      if (process.env.LANGFUSE_SECRET_KEY && process.env.LANGFUSE_PUBLIC_KEY) {
+        try {
+          const { CallbackHandler } = await import('@langfuse/langchain');
+          langfuseHandler = new CallbackHandler({
+            sessionId: boardId,
+            userId,
+            metadata: { command },
+            tags: ['whiteboard-command'],
+          });
+          callbacks.push(langfuseHandler);
+        } catch {
+          console.warn('Langfuse not available, skipping tracing');
+        }
+      }
 
       let iterations = 0;
       while (iterations < MAX_ITERATIONS) {
         iterations++;
 
         const response = await modelWithTools.invoke(messages, {
-          callbacks: [langfuseHandler],
+          callbacks,
           metadata: {
             boardId,
             userId,
@@ -113,7 +123,7 @@ export class AIAgent {
               ? response.content
               : JSON.stringify(response.content);
 
-          await langfuseHandler.shutdownAsync();
+          if (langfuseHandler) await langfuseHandler.shutdownAsync();
           return {
             success: true,
             result: {
