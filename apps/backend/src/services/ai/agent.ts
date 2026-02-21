@@ -175,7 +175,7 @@ export class AIAgent {
         }
       }
 
-      await langfuseHandler.shutdownAsync();
+      if (langfuseHandler) await langfuseHandler.shutdownAsync();
       return {
         success: true,
         result: {
@@ -202,7 +202,7 @@ export class AIAgent {
 
       return {
         success: false,
-        error: 'Failed to execute AI command',
+        error: `Failed to execute AI command: ${errorMessage}`,
         fallback: 'Please try rephrasing your command',
       };
     }
