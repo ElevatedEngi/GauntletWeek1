@@ -8,6 +8,7 @@
     "packages/*"
   ],
   "scripts": {
+    "start": "npm run start --workspace=apps/backend",
     "dev": "turbo run dev --parallel",
     "build": "turbo run build",
     "test": "turbo run test",

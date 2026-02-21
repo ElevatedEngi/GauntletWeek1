@@ -50,9 +50,18 @@ app.use('/api/auth', authRoutes);
 app.use('/api/boards', boardRoutes);
 app.use('/api/ai', aiRoutes);
 
-// Health check
+// Health check with env diagnostics
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    env: {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ? 'SET' : 'MISSING',
+      FIREBASE_DATABASE_URL: process.env.FIREBASE_DATABASE_URL ? 'SET' : 'MISSING',
+      NODE_ENV: process.env.NODE_ENV || 'not set',
+      PORT: process.env.PORT || '3000 (default)',
+    },
+  });
 });
 
 // WebSocket connection
