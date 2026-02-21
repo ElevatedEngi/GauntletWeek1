@@ -1,6 +1,24 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
+import { initializeApp, getApps, cert } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
 import { Socket } from 'socket.io';
+
+// Initialize Firebase Admin SDK (once)
+if (getApps().length === 0) {
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (serviceAccountJson) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    initializeApp({
+      credential: cert(serviceAccount),
+      databaseURL: process.env.FIREBASE_DATABASE_URL,
+    });
+  } else {
+    // Falls back to GOOGLE_APPLICATION_CREDENTIALS env var or default credentials
+    initializeApp({
+      databaseURL: process.env.FIREBASE_DATABASE_URL,
+    });
+  }
+}
 
 export interface AuthRequest extends Request {
   user?: {
@@ -10,7 +28,7 @@ export interface AuthRequest extends Request {
   };
 }
 
-export const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) => {
+export const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunction) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -19,19 +37,20 @@ export const authenticateToken = (req: AuthRequest, res: Response, next: NextFun
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret') as {
-      id: string;
-      email: string;
-      name: string;
+    const decoded = await getAuth().verifyIdToken(token);
+    req.user = {
+      id: decoded.uid,
+      email: decoded.email || '',
+      name: decoded.name || decoded.email || '',
     };
-    req.user = decoded;
     return next();
   } catch (error) {
+    console.error('Auth error:', error);
     return res.status(403).json({ error: 'Invalid or expired token' });
   }
 };
 
-export const authenticateSocket = (socket: Socket, next: (err?: Error) => void) => {
+export const authenticateSocket = async (socket: Socket, next: (err?: Error) => void) => {
   const token = socket.handshake.auth.token;
 
   if (!token) {
@@ -39,8 +58,12 @@ export const authenticateSocket = (socket: Socket, next: (err?: Error) => void) 
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret');
-    socket.data.user = decoded;
+    const decoded = await getAuth().verifyIdToken(token);
+    socket.data.user = {
+      id: decoded.uid,
+      email: decoded.email || '',
+      name: decoded.name || decoded.email || '',
+    };
     next();
   } catch (error) {
     next(new Error('Authentication error: invalid token'));
