@@ -14,9 +14,16 @@ dotenv.config({ path: '.env.local' });
 
 const app: Express = express();
 const httpServer = createServer(app);
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://whiteboard-collab-98431547.web.app',
+  'https://whiteboard-collab-98431547.firebaseapp.com',
+  'http://localhost:5173',
+].filter(Boolean) as string[];
+
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: allowedOrigins,
     credentials: true,
   },
   transports: ['websocket', 'polling'],
@@ -26,7 +33,7 @@ const io = new SocketIOServer(httpServer, {
 app.use(helmet());
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: allowedOrigins,
     credentials: true,
   })
 );
