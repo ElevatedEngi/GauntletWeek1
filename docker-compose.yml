@@ -1,0 +1,69 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount source for live editing (dev mode)
+      - ./apps/backend/src:/app/apps/backend/src
+      - ./packages/shared-types/src:/app/packages/shared-types/src
+      # Mount env file
+      - ./apps/backend/.env.local:/app/apps/backend/.env.local:ro
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - FRONTEND_URL=http://localhost:5173
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - whiteboard-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      # Mount source for HMR (dev mode)
+      - ./apps/frontend/src:/app/apps/frontend/src
+      - ./apps/frontend/index.html:/app/apps/frontend/index.html
+      - ./packages/shared-types/src:/app/packages/shared-types/src
+      # Mount env files
+      - ./apps/frontend/.env:/app/apps/frontend/.env:ro
+      - ./apps/frontend/.env.local:/app/apps/frontend/.env.local:ro
+    environment:
+      - VITE_API_URL=http://localhost:3000
+      - VITE_PROXY_TARGET=http://backend:3000
+    depends_on:
+      - backend
+    networks:
+      - whiteboard-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - whiteboard-net
+    restart: unless-stopped
+
+networks:
+  whiteboard-net:
+    driver: bridge
+
+volumes:
+  redis-data:

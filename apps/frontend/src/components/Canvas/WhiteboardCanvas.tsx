@@ -39,6 +39,12 @@ const GRID_SIZE = 20;
 const DEFAULT_OBJECT_WIDTH = 150;
 const DEFAULT_OBJECT_HEIGHT = 100;
 const OBJECT_COLORS = ['#FEE2E2', '#FEF3C7', '#DCFCE7', '#DBEAFE', '#E9D5FF'];
+const COLOR_PALETTE = [
+  '#FEE2E2', '#FEF3C7', '#DCFCE7', '#DBEAFE', '#E9D5FF', // pastel
+  '#FCA5A5', '#FCD34D', '#6EE7B7', '#93C5FD', '#C4B5FD', // medium
+  '#EF4444', '#F59E0B', '#10B981', '#3B82F6', '#8B5CF6', // vivid
+  '#FFFFFF', '#F3F4F6', '#9CA3AF', '#4B5563', '#1F2937', // grays
+];
 
 const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   // canvasAreaRef: a plain div that React renders. We imperatively create the
@@ -78,6 +84,13 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   const connectionStyleRef = useRef<'line' | 'arrow'>('arrow');
   const rubberBandLineRef = useRef<fabric.Line | null>(null);
   const sourceHighlightRef = useRef<fabric.Object | null>(null);
+
+  // ── Color picker state ─────────────────────────────────────────────────────
+  const [selectedObjId, setSelectedObjId] = useState<string | null>(null);
+  const [showColorPicker, setShowColorPicker] = useState(false);
+
+  // ── Clipboard for copy/paste ───────────────────────────────────────────────
+  const clipboardRef = useRef<BoardObject[]>([]);
 
   const { objects, addObject, updateObject: updateObjectStore, deleteObject, isConnected } = useBoardStore();
   const { user, cursorColor } = useAuthStore();
@@ -522,7 +535,84 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     };
   }, []);
 
-  // Handle keyboard events for object deletion (with connector cascade)
+  // ── Helper: collect all unique objectIds from active selection (single or multi) ──
+  const getSelectedObjectIds = useCallback((canvas: fabric.Canvas): string[] => {
+    const active = canvas.getActiveObject();
+    if (!active) return [];
+    // Multi-select (ActiveSelection)
+    if (active.type === 'activeSelection') {
+      const group = active as fabric.ActiveSelection;
+      const ids = new Set<string>();
+      group.getObjects().forEach((obj) => {
+        if (obj.data?.objectId) ids.add(obj.data.objectId as string);
+      });
+      return Array.from(ids);
+    }
+    // Single select
+    if (active.data?.objectId) return [active.data.objectId as string];
+    return [];
+  }, []);
+
+  // ── Helper: delete a single object by ID (with connector cascade) ──────────
+  const deleteObjectById = useCallback((canvas: fabric.Canvas, objectId: string) => {
+    const store = useBoardStore.getState();
+    const objData = store.objects.get(objectId);
+    if (!objData) return;
+
+    // If deleting a shape, cascade-delete all attached connectors
+    if (objData.type !== ObjectType.CONNECTOR) {
+      const attachedConnectors = connectorIndexRef.current.get(objectId);
+      if (attachedConnectors) {
+        attachedConnectors.forEach((connId) => {
+          deleteObject(connId);
+          const connRef = ref(realtimeDb, `boards/${boardId}/objects/${connId}`);
+          remove(connRef).catch(console.error);
+          canvas.getObjects()
+            .filter((o) => o.data?.objectId === connId)
+            .forEach((o) => canvas.remove(o));
+        });
+      }
+    }
+
+    // Delete from local store + Firebase
+    deleteObject(objectId);
+    const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${objectId}`);
+    remove(objectRef).catch(console.error);
+
+    // Remove all canvas items for this object
+    canvas.getObjects()
+      .filter((obj) => obj.data?.objectId === objectId)
+      .forEach((obj) => canvas.remove(obj));
+  }, [deleteObject, boardId]);
+
+  // ── Helper: duplicate objects by IDs ────────────────────────────────────────
+  const duplicateObjects = useCallback((sourceObjects: BoardObject[], offset = 20) => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas || !user) return;
+
+    sourceObjects.forEach((srcObj) => {
+      if (srcObj.type === ObjectType.CONNECTOR) return; // skip connectors
+      const newId = uuidv4();
+      const newObject: BoardObject = {
+        ...srcObj,
+        id: newId,
+        position: { x: srcObj.position.x + offset, y: srcObj.position.y + offset },
+        userId: user.id,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        childObjectIds: undefined, // frames lose children on duplicate
+      };
+
+      recentlyCreatedIds.current.add(newId);
+      setTimeout(() => recentlyCreatedIds.current.delete(newId), 2000);
+
+      addObject(newObject);
+      const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${newId}`);
+      set(objectRef, newObject).catch(console.error);
+    });
+  }, [user, boardId, addObject]);
+
+  // Handle keyboard events: delete, duplicate, copy/paste
   useEffect(() => {
     if (!fabricCanvasRef.current) return;
 
@@ -535,59 +625,72 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         return;
       }
 
-      // Don't delete if we're editing text
+      // Don't handle shortcuts while editing text (except Escape)
       if (isEditingTextRef.current) return;
 
-      const target = canvas.getActiveObject();
+      const metaOrCtrl = e.metaKey || e.ctrlKey;
 
-      // Only delete on Delete/Backspace keys, and only if not editing text
-      if ((e.key === 'Delete' || e.key === 'Backspace') && target) {
-        // Check if the target is a text object being edited
-        const isTextbox = target.type === 'textbox' || target.type === 'i-text';
-        if (isTextbox && (target as any).isEditing) {
-          // Don't delete the object, let the text editor handle backspace
-          return;
+      // ── Copy (Ctrl+C) ──────────────────────────────────────────────────
+      if (metaOrCtrl && e.key === 'c') {
+        const ids = getSelectedObjectIds(canvas);
+        if (ids.length === 0) return;
+        const store = useBoardStore.getState();
+        clipboardRef.current = ids
+          .map((id) => store.objects.get(id))
+          .filter((obj): obj is BoardObject => !!obj && obj.type !== ObjectType.CONNECTOR);
+        e.preventDefault();
+        return;
+      }
+
+      // ── Paste (Ctrl+V) ─────────────────────────────────────────────────
+      if (metaOrCtrl && e.key === 'v') {
+        if (clipboardRef.current.length > 0) {
+          duplicateObjects(clipboardRef.current, 30);
+          e.preventDefault();
         }
+        return;
+      }
 
-        if (target.data?.objectId) {
-          const objectId = target.data.objectId as string;
-          const dataType = target.data.type as string;
+      // ── Duplicate (Ctrl+D) ─────────────────────────────────────────────
+      if (metaOrCtrl && e.key === 'd') {
+        const ids = getSelectedObjectIds(canvas);
+        if (ids.length === 0) return;
+        const store = useBoardStore.getState();
+        const objs = ids
+          .map((id) => store.objects.get(id))
+          .filter((obj): obj is BoardObject => !!obj);
+        duplicateObjects(objs, 20);
+        e.preventDefault();
+        return;
+      }
 
-          // If deleting a shape, cascade-delete all attached connectors
-          if (dataType === 'shape') {
-            const attachedConnectors = connectorIndexRef.current.get(objectId);
-            if (attachedConnectors) {
-              attachedConnectors.forEach((connId) => {
-                deleteObject(connId);
-                const connRef = ref(realtimeDb, `boards/${boardId}/objects/${connId}`);
-                remove(connRef).catch(console.error);
-                canvas.getObjects()
-                  .filter((o) => o.data?.objectId === connId)
-                  .forEach((o) => canvas.remove(o));
-              });
-            }
-          }
-
-          // Delete from local store
-          deleteObject(objectId);
-
-          // Delete from Firebase Realtime Database
-          const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${objectId}`);
-          remove(objectRef).catch((error) => {
-            console.error('Failed to delete object from Firebase:', error);
-          });
-
-          // Remove all canvas items for this object (shape+text, or connector+arrowhead)
-          const objectsToRemove = canvas.getObjects().filter(
-            (obj) => obj.data?.objectId === objectId
-          );
-
-          objectsToRemove.forEach((obj) => canvas.remove(obj));
-        } else {
-          // If no objectId, just remove the selected object
-          canvas.remove(target);
+      // ── Select All (Ctrl+A) ────────────────────────────────────────────
+      if (metaOrCtrl && e.key === 'a') {
+        e.preventDefault();
+        canvas.discardActiveObject();
+        const selectableObjs = canvas.getObjects().filter(
+          (o) => o.selectable && o.data?.type === 'shape'
+        );
+        if (selectableObjs.length > 0) {
+          const sel = new fabric.ActiveSelection(selectableObjs, { canvas });
+          canvas.setActiveObject(sel);
+          canvas.requestRenderAll();
         }
+        return;
+      }
 
+      // ── Delete / Backspace ─────────────────────────────────────────────
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        const active = canvas.getActiveObject();
+        if (!active) return;
+
+        // Don't delete if a textbox is being edited
+        const isTextbox = active.type === 'textbox' || active.type === 'i-text';
+        if (isTextbox && (active as any).isEditing) return;
+
+        const ids = getSelectedObjectIds(canvas);
+        canvas.discardActiveObject();
+        ids.forEach((id) => deleteObjectById(canvas, id));
         canvas.renderAll();
         e.preventDefault();
       }
@@ -595,7 +698,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [deleteObject, boardId, isConnecting]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [deleteObject, boardId, isConnecting, getSelectedObjectIds, deleteObjectById, duplicateObjects]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Throttled cursor position broadcast to Firebase (30 Hz).
   // Uses canvasAreaRef (inner Fabric canvas div) — not the outer BoardPage wrapper —
@@ -635,7 +738,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   }, [isConnected, user, boardId, cursorColor]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // createObject: defined as useCallback so it always captures current user/boardId/canvas
-  const createObject = useCallback((type: 'sticky_note' | 'rectangle' | 'circle' | 'arrow') => {
+  const createObject = useCallback((type: 'sticky_note' | 'rectangle' | 'circle' | 'arrow' | 'text_box' | 'frame') => {
     const canvas = fabricCanvasRef.current;
     // Scenario 2: log guard failures so they're visible in DevTools
     if (!user || !canvas) {
@@ -659,15 +762,21 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       type === 'sticky_note' ? 'Double-click to edit' :
       type === 'rectangle' ? 'Click to edit text' :
       type === 'arrow' ? 'Label arrow' :
+      type === 'text_box' ? 'Type here' :
+      type === 'frame' ? '' :
       'Edit me!';
 
-    const objectHeight = type === 'arrow' ? 60 : DEFAULT_OBJECT_HEIGHT;
+    const FRAME_WIDTH = 400;
+    const FRAME_HEIGHT = 300;
+    const objectWidth = type === 'frame' ? FRAME_WIDTH : DEFAULT_OBJECT_WIDTH;
+    const objectHeight = type === 'arrow' ? 60 : type === 'frame' ? FRAME_HEIGHT : DEFAULT_OBJECT_HEIGHT;
+    const defaultFontSize = type === 'text_box' ? 24 : 13;
 
     const newObject: BoardObject = {
       id: uuidv4(),
       type: ObjectType[type.toUpperCase() as keyof typeof ObjectType],
       position: { x: centerX, y: centerY },
-      width: DEFAULT_OBJECT_WIDTH,
+      width: objectWidth,
       height: objectHeight,
       rotation: 0,
       content: defaultContent,
@@ -675,6 +784,8 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       userId: user.id,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      ...(type === 'text_box' ? { fontSize: defaultFontSize } : {}),
+      ...(type === 'frame' ? { childObjectIds: [], frameLabel: 'Frame' } : {}),
     };
 
     // Immediately render on canvas (don't wait for store→effect→sync chain)
@@ -717,6 +828,85 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         fill: randomColor, stroke: '#6b7280', strokeWidth: 2,
         selectable: true, hasControls: true, objectCaching: false,
       });
+    }
+
+    // FRAME: dashed rectangle container for grouping objects
+    if (type === 'frame') {
+      const frameRect = new fabric.Rect({
+        left: centerX, top: centerY,
+        width: FRAME_WIDTH, height: FRAME_HEIGHT,
+        fill: 'rgba(59, 130, 246, 0.04)',
+        stroke: '#3b82f6', strokeWidth: 2,
+        strokeDashArray: [8, 4],
+        rx: 8,
+        hasControls: true, selectable: true,
+      });
+      frameRect.set({
+        data: { objectId: newObject.id, userId: user.id, type: 'shape', isFrame: true },
+      });
+      canvas.add(frameRect);
+      canvas.sendToBack(frameRect);
+
+      // Frame label
+      const label = new fabric.Text('Frame', {
+        left: centerX + 8, top: centerY - 22,
+        fontSize: 12, fontFamily: 'Arial, sans-serif',
+        fill: '#3b82f6', fontWeight: 'bold',
+        selectable: false, evented: false,
+      });
+      label.set({ data: { objectId: newObject.id, type: 'frameLabel' } });
+      canvas.add(label);
+
+      canvas.renderAll();
+
+      recentlyCreatedIds.current.add(newObject.id);
+      setTimeout(() => recentlyCreatedIds.current.delete(newObject.id), 2000);
+
+      addObject(newObject);
+      const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${newObject.id}`);
+      set(objectRef, newObject).catch(console.error);
+      return;
+    }
+
+    // TEXT_BOX: single textbox that acts as both shape and text
+    if (type === 'text_box') {
+      const tbObj = new fabric.Textbox(defaultContent, {
+        left: centerX,
+        top: centerY,
+        width: DEFAULT_OBJECT_WIDTH,
+        fontSize: defaultFontSize,
+        fontFamily: 'Arial, sans-serif',
+        fill: '#1f2937',
+        editable: true,
+        hasControls: true,
+        selectable: true,
+        evented: true,
+        hoverCursor: 'move',
+        splitByGrapheme: true,
+        textAlign: 'center',
+        lineHeight: 1.2,
+        borderColor: '#3b82f6',
+        editingBorderColor: '#3b82f6',
+        padding: 8,
+      });
+      tbObj.set({
+        data: {
+          objectId: newObject.id, userId: user.id, type: 'shape',
+          isTextBox: true, baseFontSize: defaultFontSize,
+        },
+      });
+      canvas.add(tbObj);
+      canvas.renderAll();
+
+      recentlyCreatedIds.current.add(newObject.id);
+      setTimeout(() => recentlyCreatedIds.current.delete(newObject.id), 2000);
+
+      addObject(newObject);
+      const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${newObject.id}`);
+      set(objectRef, newObject).catch((err) => {
+        console.error('Failed to write object to Firebase:', err);
+      });
+      return; // TEXT_BOX uses a single canvas object — skip the shape+text pair below
     }
 
     if (shapeObj) {
@@ -927,6 +1117,77 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     };
   }, [isConnecting, createConnector, cancelConnectionMode]);
 
+  // ── Selection tracking for color picker ────────────────────────────────────
+  useEffect(() => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+
+    const onSelected = () => {
+      const active = canvas.getActiveObject();
+      if (active?.data?.objectId) {
+        const objType = active.data.type as string;
+        // Only show color picker for shapes (including textbox shapes), not connectors/arrowheads
+        if (objType === 'shape' || objType === 'text') {
+          setSelectedObjId(active.data.objectId as string);
+          return;
+        }
+      }
+      setSelectedObjId(null);
+      setShowColorPicker(false);
+    };
+
+    const onCleared = () => {
+      setSelectedObjId(null);
+      setShowColorPicker(false);
+    };
+
+    canvas.on('selection:created', onSelected);
+    canvas.on('selection:updated', onSelected);
+    canvas.on('selection:cleared', onCleared);
+
+    return () => {
+      canvas.off('selection:created', onSelected);
+      canvas.off('selection:updated', onSelected);
+      canvas.off('selection:cleared', onCleared);
+    };
+  }, []);
+
+  // ── Change color of selected object ────────────────────────────────────────
+  const changeObjectColor = useCallback((color: string) => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas || !selectedObjId) return;
+
+    const store = useBoardStore.getState();
+    const objData = store.objects.get(selectedObjId);
+    if (!objData) return;
+
+    const isTextBox = objData.type === ObjectType.TEXT_BOX;
+
+    // Update all canvas objects for this ID
+    canvas.getObjects().forEach((o) => {
+      if (o.data?.objectId !== selectedObjId) return;
+      const dtype = o.data?.type as string;
+
+      if (dtype === 'shape') {
+        if (isTextBox) {
+          // Text box: change the text fill color
+          (o as fabric.Textbox).set({ fill: color });
+        } else {
+          // Regular shape: change the background fill
+          o.set({ fill: color });
+        }
+      }
+    });
+    canvas.renderAll();
+
+    // Update store and Firebase
+    updateObjectStore(selectedObjId, { color });
+    const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${selectedObjId}`);
+    update(objectRef, { color, updatedAt: Date.now() }).catch(console.error);
+
+    setShowColorPicker(false);
+  }, [selectedObjId, boardId, updateObjectStore]);
+
   return (
     <div ref={containerRef} tabIndex={-1} className="w-full h-full flex flex-col bg-white outline-none">
       {/* Toolbar */}
@@ -967,6 +1228,15 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           ➜ Arrow
         </button>
 
+        <button
+          onClick={() => createObject('text_box')}
+          disabled={!canvasReady}
+          className="px-3 py-2 bg-gray-200 text-gray-900 rounded hover:bg-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium"
+          title="Create text box — resize to scale text"
+        >
+          Aa Text
+        </button>
+
         {/* Separator */}
         <div className="w-px h-6 bg-gray-300 mx-1" />
 
@@ -996,6 +1266,52 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         >
           → Arrow
         </button>
+
+        {/* Separator */}
+        <div className="w-px h-6 bg-gray-300 mx-1" />
+
+        {/* Frame button */}
+        <button
+          onClick={() => createObject('frame')}
+          disabled={!canvasReady}
+          className="px-3 py-2 bg-blue-100 text-blue-800 rounded hover:bg-blue-200 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium border border-blue-300 border-dashed"
+          title="Create a frame to group objects"
+        >
+          [ ] Frame
+        </button>
+
+        {/* Color picker — visible when an object is selected */}
+        {selectedObjId && (
+          <>
+            <div className="w-px h-6 bg-gray-300 mx-1" />
+            <div className="relative">
+              <button
+                onClick={() => setShowColorPicker((v) => !v)}
+                className="px-3 py-2 bg-white border border-gray-300 rounded hover:bg-gray-100 transition text-sm font-medium flex items-center gap-1.5"
+                title="Change color"
+              >
+                <span
+                  className="inline-block w-4 h-4 rounded border border-gray-400"
+                  style={{ backgroundColor: objects.get(selectedObjId)?.color || '#ccc' }}
+                />
+                Color
+              </button>
+              {showColorPicker && (
+                <div className="absolute top-full left-0 mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg p-2 grid grid-cols-5 gap-1 w-40">
+                  {COLOR_PALETTE.map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => changeObjectColor(c)}
+                      className="w-6 h-6 rounded border border-gray-300 hover:scale-110 transition-transform"
+                      style={{ backgroundColor: c }}
+                      title={c}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        )}
 
         <div className="flex-1" />
 
@@ -1091,10 +1407,13 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       <div className="absolute bottom-4 left-4 text-xs text-gray-500 bg-white/90 backdrop-blur-sm px-3 py-2 rounded-lg border border-gray-200 shadow-sm leading-5 select-none">
         <p><kbd className="font-mono bg-gray-100 px-1 rounded">↑ ↓ ← →</kbd> Pan canvas</p>
         <p><kbd className="font-mono bg-gray-100 px-1 rounded">Space</kbd> + drag to pan</p>
-        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Right-click</kbd> + drag to pan</p>
         <p><kbd className="font-mono bg-gray-100 px-1 rounded">Z</kbd> + scroll to zoom</p>
-        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Del</kbd> / <kbd className="font-mono bg-gray-100 px-1 rounded">Backspace</kbd> to remove</p>
-        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Dbl-click</kbd> shape to edit text</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Del</kbd> Delete selected</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Ctrl+D</kbd> Duplicate</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Ctrl+C/V</kbd> Copy / Paste</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Ctrl+A</kbd> Select all</p>
+        <p><kbd className="font-mono bg-gray-100 px-1 rounded">Shift+click</kbd> Multi-select</p>
+        <p>Drag empty area to box-select</p>
       </div>
     </div>
   );
@@ -1105,7 +1424,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   function setupCanvasEventListeners(canvas: fabric.Canvas) {
     const textPadding = 15;
 
-    // Handle object modification (shape moved/resized)
+    // Handle object modification (shape moved/resized/rotated)
     canvas.on('object:modified', (e: fabric.IEvent) => {
       const target = e.target;
       if (!target || !target.data?.objectId) return;
@@ -1113,28 +1432,75 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const objectId = target.data.objectId as string;
       const targetType = target.data.type as string;
 
+      // Handle multi-select (ActiveSelection) — sync each child object
+      if (target.type === 'activeSelection') {
+        const group = target as fabric.ActiveSelection;
+        group.getObjects().forEach((child) => {
+          if (!child.data?.objectId || child.data?.type !== 'shape') return;
+          const childId = child.data.objectId as string;
+          // Get the actual canvas position (group offsets child coords)
+          const matrix = child.calcTransformMatrix();
+          const point = new fabric.Point(0, 0);
+          const absPos = fabric.util.transformPoint(point, matrix);
+          const newW = (child.width || DEFAULT_OBJECT_WIDTH) * (child.scaleX || 1);
+          const newH = (child.height || DEFAULT_OBJECT_HEIGHT) * (child.scaleY || 1);
+
+          const childUpdates: Record<string, unknown> = {
+            position: { x: absPos.x - newW / 2, y: absPos.y - newH / 2 },
+            width: newW,
+            height: newH,
+            rotation: child.angle || 0,
+            updatedAt: Date.now(),
+          };
+          updateObjectStore(childId, childUpdates);
+          const objRef = ref(realtimeDb, `boards/${boardId}/objects/${childId}`);
+          update(objRef, childUpdates).catch(console.error);
+        });
+        canvas.renderAll();
+        return;
+      }
+
       // Only sync shape modifications (not text, since text is locked to shape)
       if (targetType === 'shape') {
-        // Find and update the corresponding text position
-        const textObj = canvas.getObjects().find(
-          (obj) => obj.data?.objectId === objectId && obj.data?.type === 'text'
-        ) as fabric.Textbox;
+        const isTextBox = !!target.data?.isTextBox;
+        const isFrame = !!target.data?.isFrame;
 
-        if (textObj) {
-          textObj.set({
-            left: (target.left || 0) + textPadding,
-            top: (target.top || 0) + textPadding,
-          });
-          textObj.setCoords();
+        // Normalize scale: bake scaleX/Y into width/height, reset scale to 1
+        const newWidth = (target.width || DEFAULT_OBJECT_WIDTH) * (target.scaleX || 1);
+        const newHeight = (target.height || DEFAULT_OBJECT_HEIGHT) * (target.scaleY || 1);
+
+        if (!isTextBox) {
+          target.set({ width: newWidth, height: newHeight, scaleX: 1, scaleY: 1 });
+          target.setCoords();
+
+          // For regular shapes, find and update the corresponding text position + width
+          const textObj = canvas.getObjects().find(
+            (obj) => obj.data?.objectId === objectId && obj.data?.type === 'text'
+          ) as fabric.Textbox;
+
+          if (textObj) {
+            textObj.set({
+              left: (target.left || 0) + textPadding,
+              top: (target.top || 0) + textPadding,
+              width: Math.max(50, newWidth - textPadding * 2),
+            });
+            textObj.data.maxWidth = newWidth - textPadding * 2;
+            textObj.setCoords();
+          }
         }
 
-        const updates = {
+        const updates: Record<string, unknown> = {
           position: { x: target.left || 0, y: target.top || 0 },
-          width: target.width || DEFAULT_OBJECT_WIDTH,
-          height: target.height || DEFAULT_OBJECT_HEIGHT,
+          width: newWidth,
+          height: newHeight,
           rotation: target.angle || 0,
           updatedAt: Date.now(),
         };
+
+        // For TEXT_BOX, also persist the current fontSize
+        if (isTextBox) {
+          updates.fontSize = (target as fabric.Textbox).fontSize || 24;
+        }
 
         // Update local store (optimistic update)
         updateObjectStore(objectId, updates);
@@ -1151,6 +1517,95 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           attachedConnectors.forEach((connId) => updateConnectorOnCanvas(canvas, connId));
         }
 
+        // Frame: move children with frame
+        if (isFrame && e.transform) {
+          const transform = e.transform as any;
+          const dx = (target.left || 0) - (transform.original?.left || 0);
+          const dy = (target.top || 0) - (transform.original?.top || 0);
+          if (dx !== 0 || dy !== 0) {
+            const store = useBoardStore.getState();
+            const frameData = store.objects.get(objectId);
+            const childIds = frameData?.childObjectIds || [];
+            childIds.forEach((childId: string) => {
+              const childShape = canvas.getObjects().find(
+                (o) => o.data?.objectId === childId && o.data?.type === 'shape'
+              );
+              if (childShape) {
+                childShape.set({
+                  left: (childShape.left || 0) + dx,
+                  top: (childShape.top || 0) + dy,
+                });
+                childShape.setCoords();
+                // Also move the child text
+                const childText = canvas.getObjects().find(
+                  (o) => o.data?.objectId === childId && o.data?.type === 'text'
+                );
+                if (childText) {
+                  childText.set({
+                    left: (childText.left || 0) + dx,
+                    top: (childText.top || 0) + dy,
+                  });
+                  childText.setCoords();
+                }
+                // Sync child position to Firebase
+                const childUpdates = {
+                  position: { x: childShape.left || 0, y: childShape.top || 0 },
+                  updatedAt: Date.now(),
+                };
+                updateObjectStore(childId, childUpdates);
+                const childRef = ref(realtimeDb, `boards/${boardId}/objects/${childId}`);
+                update(childRef, childUpdates).catch(console.error);
+              }
+            });
+          }
+        }
+
+        // Frame membership: if a non-frame shape was dropped inside a frame, add it as a child
+        if (!target.data?.isFrame && targetType === 'shape') {
+          const store = useBoardStore.getState();
+          const objLeft = target.left || 0;
+          const objTop = target.top || 0;
+          const objW = (target.width || 0) * (target.scaleX || 1);
+          const objH = (target.height || 0) * (target.scaleY || 1);
+          const objCenterX = objLeft + objW / 2;
+          const objCenterY = objTop + objH / 2;
+
+          // Find if the object center is inside any frame
+          let newParentFrameId: string | null = null;
+          store.objects.forEach((frameObj) => {
+            if (frameObj.type !== ObjectType.FRAME) return;
+            if (objCenterX >= frameObj.position.x && objCenterX <= frameObj.position.x + frameObj.width &&
+                objCenterY >= frameObj.position.y && objCenterY <= frameObj.position.y + frameObj.height) {
+              newParentFrameId = frameObj.id;
+            }
+          });
+
+          // Remove from any previous frame
+          store.objects.forEach((frameObj) => {
+            if (frameObj.type !== ObjectType.FRAME || !frameObj.childObjectIds) return;
+            if (frameObj.childObjectIds.includes(objectId) && frameObj.id !== newParentFrameId) {
+              const newChildren = frameObj.childObjectIds.filter((id: string) => id !== objectId);
+              updateObjectStore(frameObj.id, { childObjectIds: newChildren });
+              const frameRef = ref(realtimeDb, `boards/${boardId}/objects/${frameObj.id}`);
+              update(frameRef, { childObjectIds: newChildren, updatedAt: Date.now() }).catch(console.error);
+            }
+          });
+
+          // Add to new frame if applicable
+          if (newParentFrameId) {
+            const frameObj = store.objects.get(newParentFrameId);
+            if (frameObj) {
+              const currentChildren = frameObj.childObjectIds || [];
+              if (!currentChildren.includes(objectId)) {
+                const newChildren = [...currentChildren, objectId];
+                updateObjectStore(newParentFrameId, { childObjectIds: newChildren });
+                const frameRef = ref(realtimeDb, `boards/${boardId}/objects/${newParentFrameId}`);
+                update(frameRef, { childObjectIds: newChildren, updatedAt: Date.now() }).catch(console.error);
+              }
+            }
+          }
+        }
+
         canvas.renderAll();
       }
     });
@@ -1158,7 +1613,9 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     // Handle text changes in all shapes (with debounced sync)
     canvas.on('text:changed', (e: fabric.IEvent) => {
       const target = e.target as fabric.Textbox;
-      if (!target || !target.data?.objectId || target.data?.type !== 'text') return;
+      if (!target || !target.data?.objectId) return;
+      // Allow text changes from 'text' type (regular shapes) and 'shape' with isTextBox (TEXT_BOX)
+      if (target.data?.type !== 'text' && !target.data?.isTextBox) return;
 
       const objectId = target.data.objectId as string;
 
@@ -1207,7 +1664,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const target = e.target as fabric.Textbox;
 
       // Update store with final text value when editing completes
-      if (target && target.data?.objectId && target.data?.type === 'text') {
+      if (target && target.data?.objectId && (target.data?.type === 'text' || target.data?.isTextBox)) {
         const objectId = target.data.objectId as string;
         const content = target.text || '';
         updateObjectStore(objectId, { content });
@@ -1230,6 +1687,9 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     });
 
     // Handle object moving — keep text glued to shape locally AND broadcast to other users
+    // Track previous frame position for delta calculation during drag
+    const frameDragPrev = new Map<string, { x: number; y: number }>();
+
     canvas.on('object:moving', (e: fabric.IEvent) => {
       const target = e.target;
       if (!target || !target.data?.objectId) return;
@@ -1238,6 +1698,8 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const targetType = target.data.type as string;
 
       if (targetType === 'shape') {
+        const isFrame = !!target.data?.isFrame;
+
         // Keep text object visually glued to shape
         const textObj = canvas.getObjects().find(
           (obj) => obj.data?.objectId === objectId && obj.data?.type === 'text'
@@ -1249,6 +1711,64 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
             top: (target.top || 0) + textPadding,
           });
           textObj.setCoords();
+        }
+
+        // Frame: move label and children with it
+        if (isFrame) {
+          // Update frame label position
+          const frameLabel = canvas.getObjects().find(
+            (o) => o.data?.objectId === objectId && o.data?.type === 'frameLabel'
+          );
+          if (frameLabel) {
+            frameLabel.set({
+              left: (target.left || 0) + 8,
+              top: (target.top || 0) - 22,
+            });
+            frameLabel.setCoords();
+          }
+
+          // Move children with frame (delta-based)
+          const prev = frameDragPrev.get(objectId);
+          const curX = target.left || 0;
+          const curY = target.top || 0;
+          if (prev) {
+            const dx = curX - prev.x;
+            const dy = curY - prev.y;
+            if (dx !== 0 || dy !== 0) {
+              const store = useBoardStore.getState();
+              const frameData = store.objects.get(objectId);
+              const childIds = frameData?.childObjectIds || [];
+              childIds.forEach((childId: string) => {
+                const childShape = canvas.getObjects().find(
+                  (o) => o.data?.objectId === childId && o.data?.type === 'shape'
+                );
+                if (childShape) {
+                  childShape.set({
+                    left: (childShape.left || 0) + dx,
+                    top: (childShape.top || 0) + dy,
+                  });
+                  childShape.setCoords();
+                  // Also move child text
+                  const childText = canvas.getObjects().find(
+                    (o) => o.data?.objectId === childId && o.data?.type === 'text'
+                  );
+                  if (childText) {
+                    childText.set({
+                      left: (childText.left || 0) + dx,
+                      top: (childText.top || 0) + dy,
+                    });
+                    childText.setCoords();
+                  }
+                  // Update connectors attached to child
+                  const attachedConns = connectorIndexRef.current.get(childId);
+                  if (attachedConns) {
+                    attachedConns.forEach((connId) => updateConnectorOnCanvas(canvas, connId));
+                  }
+                }
+              });
+            }
+          }
+          frameDragPrev.set(objectId, { x: curX, y: curY });
         }
 
         // Update all connectors attached to this object in real-time
@@ -1271,6 +1791,17 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       }
     });
 
+    // Initialize frame drag tracking on mouse:down
+    canvas.on('mouse:down', (e: fabric.IEvent) => {
+      const target = e.target;
+      if (target?.data?.isFrame && target.data?.objectId) {
+        frameDragPrev.set(target.data.objectId as string, {
+          x: target.left || 0,
+          y: target.top || 0,
+        });
+      }
+    });
+
     // Handle object scaling (update text position and width during resize)
     canvas.on('object:scaling', (e: fabric.IEvent) => {
       const target = e.target;
@@ -1281,25 +1812,45 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
       // Only shapes can be scaled
       if (targetType === 'shape') {
-        const textObj = canvas.getObjects().find(
-          (obj) => obj.data?.objectId === objectId && obj.data?.type === 'text'
-        ) as fabric.Textbox;
+        const isTextBox = !!target.data?.isTextBox;
 
-        if (textObj) {
-          // Calculate new dimensions based on shape's scaled size
-          const newWidth = ((target.width || 0) * (target.scaleX || 1)) - (textPadding * 2);
-          const newLeft = (target.left || 0) + textPadding;
-          const newTop = (target.top || 0) + textPadding;
+        if (isTextBox) {
+          // TEXT_BOX: scale fontSize proportionally, then reset scale to 1
+          const tbTarget = target as fabric.Textbox;
+          const scaleAvg = ((target.scaleX || 1) + (target.scaleY || 1)) / 2;
+          const baseFontSize = (target.data?.baseFontSize as number) || 24;
+          const newFontSize = Math.max(8, Math.round(baseFontSize * scaleAvg));
+          const newWidth = (target.width || DEFAULT_OBJECT_WIDTH) * (target.scaleX || 1);
 
-          textObj.set({
-            left: newLeft,
-            top: newTop,
-            width: Math.max(50, newWidth), // Minimum width to prevent text from disappearing
+          tbTarget.set({
+            fontSize: newFontSize,
+            width: Math.max(50, newWidth),
+            scaleX: 1,
+            scaleY: 1,
           });
-          textObj.setCoords();
+          target.data.baseFontSize = newFontSize;
+          tbTarget.setCoords();
+        } else {
+          const textObj = canvas.getObjects().find(
+            (obj) => obj.data?.objectId === objectId && obj.data?.type === 'text'
+          ) as fabric.Textbox;
 
-          // Update maxWidth in data for future reference
-          textObj.data.maxWidth = newWidth;
+          if (textObj) {
+            // Calculate new dimensions based on shape's scaled size
+            const newWidth = ((target.width || 0) * (target.scaleX || 1)) - (textPadding * 2);
+            const newLeft = (target.left || 0) + textPadding;
+            const newTop = (target.top || 0) + textPadding;
+
+            textObj.set({
+              left: newLeft,
+              top: newTop,
+              width: Math.max(50, newWidth), // Minimum width to prevent text from disappearing
+            });
+            textObj.setCoords();
+
+            // Update maxWidth in data for future reference
+            textObj.data.maxWidth = newWidth;
+          }
         }
       }
     });
@@ -1330,6 +1881,18 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
       const textObj = canvas.getObjects().find(
         (obj) => obj.data?.objectId === lockObjectId && obj.data?.type === 'text'
       ) as fabric.Textbox;
+
+      // TEXT_BOX: the target IS the textbox — enter editing directly
+      if (target.data?.isTextBox) {
+        const tbTarget = target as fabric.Textbox;
+        if (!(tbTarget as any).isEditing) {
+          canvas.setActiveObject(tbTarget);
+          tbTarget.enterEditing();
+          tbTarget.selectAll();
+          canvas.requestRenderAll();
+        }
+        return;
+      }
 
       if (targetType === 'shape' || targetType === 'text') {
         if (textObj && !(textObj as any).isEditing) {
@@ -1398,9 +1961,42 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         // isShapeActive: local user is dragging this shape — don't overwrite their in-flight position
         const isShapeActive = !!shapeOnCanvas && activeObj === shapeOnCanvas;
 
+        // TEXT_BOX: single textbox object — update position, text, fontSize, and color
+        if (obj.type === ObjectType.TEXT_BOX && shapeOnCanvas && !isShapeActive) {
+          const tb = shapeOnCanvas as fabric.Textbox;
+          if (!(tb as any).isEditing) {
+            tb.set({
+              left: obj.position.x,
+              top: obj.position.y,
+              text: obj.content || '',
+              fontSize: obj.fontSize || 24,
+              width: obj.width || DEFAULT_OBJECT_WIDTH,
+              fill: obj.color || '#1f2937',
+            });
+            tb.data.baseFontSize = obj.fontSize || 24;
+            (tb as any).dirty = true;
+            tb.setCoords();
+          }
+          return;
+        }
+
         if (shapeOnCanvas && !isShapeActive) {
-          shapeOnCanvas.set({ left: obj.position.x, top: obj.position.y });
+          shapeOnCanvas.set({
+            left: obj.position.x, top: obj.position.y, fill: obj.color,
+            width: obj.width, height: obj.height,
+          });
           shapeOnCanvas.setCoords();
+
+          // Update frame label position if this is a frame
+          if (obj.type === ObjectType.FRAME) {
+            const frameLabel = canvas.getObjects().find(
+              (o) => o.data?.objectId === obj.id && o.data?.type === 'frameLabel'
+            );
+            if (frameLabel) {
+              frameLabel.set({ left: obj.position.x + 8, top: obj.position.y - 22 });
+              frameLabel.setCoords();
+            }
+          }
         }
         // Also skip text update while the local user is dragging the parent shape
         if (textOnCanvas && !isShapeActive && !(textOnCanvas as any).isEditing) {
@@ -1408,6 +2004,7 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
             left: obj.position.x + textPadding,
             top: obj.position.y + textPadding,
             text: obj.content || '',
+            width: Math.max(50, obj.width - textPadding * 2),
           });
           (textOnCanvas as any).dirty = true;
           textOnCanvas.setCoords();
@@ -1482,6 +2079,73 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
           hasControls: true,
           objectCaching: false,
         });
+      } else if (obj.type === ObjectType.TEXT_BOX) {
+        // TEXT_BOX: single textbox, no separate shape+text pair
+        const tbFontSize = obj.fontSize || 24;
+        const tbObj = new fabric.Textbox(obj.content || 'Type here', {
+          left: obj.position.x,
+          top: obj.position.y,
+          width: obj.width || DEFAULT_OBJECT_WIDTH,
+          fontSize: tbFontSize,
+          fontFamily: 'Arial, sans-serif',
+          fill: obj.color || '#1f2937',
+          editable: true,
+          hasControls: true,
+          selectable: true,
+          evented: true,
+          hoverCursor: 'move',
+          splitByGrapheme: true,
+          textAlign: 'center',
+          lineHeight: 1.2,
+          borderColor: '#3b82f6',
+          editingBorderColor: '#3b82f6',
+          padding: 8,
+        });
+        tbObj.set({
+          data: {
+            objectId: obj.id, userId: obj.userId, type: 'shape',
+            isTextBox: true, baseFontSize: tbFontSize,
+          },
+          opacity: currentUserId === obj.userId ? 1 : 0.8,
+        });
+        canvas.add(tbObj);
+        return; // skip the shape+text pair logic below
+      } else if (obj.type === ObjectType.FRAME) {
+        // FRAME: dashed rectangle container for grouping
+        const frameRect = new fabric.Rect({
+          left: obj.position.x,
+          top: obj.position.y,
+          width: obj.width || 400,
+          height: obj.height || 300,
+          fill: 'rgba(59, 130, 246, 0.04)',
+          stroke: '#3b82f6',
+          strokeWidth: 2,
+          strokeDashArray: [8, 4],
+          rx: 8,
+          hasControls: true,
+          selectable: true,
+        });
+        frameRect.set({
+          data: { objectId: obj.id, userId: obj.userId, type: 'shape', isFrame: true },
+          opacity: currentUserId === obj.userId ? 1 : 0.85,
+        });
+        canvas.add(frameRect);
+        canvas.sendToBack(frameRect);
+
+        // Frame label
+        const label = new fabric.Text(obj.frameLabel || 'Frame', {
+          left: obj.position.x + 8,
+          top: obj.position.y - 22,
+          fontSize: 12,
+          fontFamily: 'Arial, sans-serif',
+          fill: '#3b82f6',
+          fontWeight: 'bold',
+          selectable: false,
+          evented: false,
+        });
+        label.set({ data: { objectId: obj.id, type: 'frameLabel' } });
+        canvas.add(label);
+        return; // skip the shape+text pair logic below
       }
 
       if (shapeObj) {
@@ -1489,8 +2153,6 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
         shapeObj.set({
           data: { objectId: obj.id, userId: obj.userId, type: 'shape' },
           opacity: currentUserId === obj.userId ? 1 : 0.8,
-          lockScalingX: true,
-          lockScalingY: true,
         });
         canvas.add(shapeObj);
 

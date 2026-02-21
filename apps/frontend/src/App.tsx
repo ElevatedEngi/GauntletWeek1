@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import LoginPage from './components/Auth/LoginPage';
+import HomePage from './components/Home/HomePage';
 import BoardPage from './components/Board/BoardPage';
 import CreateBoardPage from './components/Board/CreateBoardPage';
 import useAuthStore from './stores/authStore';
@@ -26,10 +27,16 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Login — redirect to /board if already authenticated */}
+        {/* Login — redirect to home if already authenticated */}
         <Route
           path="/login"
-          element={isAuthenticated ? <Navigate to="/board" replace /> : <LoginPage />}
+          element={isAuthenticated ? <Navigate to="/home" replace /> : <LoginPage />}
+        />
+
+        {/* Home — dashboard showing saved boards */}
+        <Route
+          path="/home"
+          element={isAuthenticated ? <HomePage /> : <Navigate to="/login" replace />}
         />
 
         {/* /board — creates a new board and redirects to /board/:id */}
@@ -47,13 +54,13 @@ function App() {
         {/* Root — redirect based on auth state */}
         <Route
           path="/"
-          element={isAuthenticated ? <Navigate to="/board" replace /> : <Navigate to="/login" replace />}
+          element={isAuthenticated ? <Navigate to="/home" replace /> : <Navigate to="/login" replace />}
         />
 
         {/* Catch-all */}
         <Route
           path="*"
-          element={<Navigate to={isAuthenticated ? '/board' : '/login'} replace />}
+          element={<Navigate to={isAuthenticated ? '/home' : '/login'} replace />}
         />
       </Routes>
     </BrowserRouter>

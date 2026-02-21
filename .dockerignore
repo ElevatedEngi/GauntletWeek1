@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+**/dist
+**/build
+**/.next
+.git
+.github
+.vscode
+.firebase
+.turbo
+*.log
+*.md
+!README.md
+.env*.local
+functions/lib
+coverage
+.nyc_output

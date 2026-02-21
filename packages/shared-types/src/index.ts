@@ -7,6 +7,8 @@ export enum ObjectType {
   LINE = 'line',
   ARROW = 'arrow',
   CONNECTOR = 'connector',
+  TEXT_BOX = 'text_box',
+  FRAME = 'frame',
 }
 
 export interface Position {
@@ -31,6 +33,13 @@ export interface BoardObject {
   sourceObjectId?: string;
   targetObjectId?: string;
   connectorStyle?: 'line' | 'arrow';
+
+  // Text box specific (only present when type === TEXT_BOX)
+  fontSize?: number;
+
+  // Frame specific (only present when type === FRAME)
+  childObjectIds?: string[];
+  frameLabel?: string;
 }
 
 export interface User {
@@ -128,9 +137,19 @@ export interface AICommandRequest {
   boardId: string;
 }
 
+export interface AIToolAction {
+  tool: string;
+  description: string;
+  objectId?: string;
+}
+
 export interface AICommandResponse {
   success: boolean;
-  result?: unknown;
+  result?: {
+    message: string;
+    boardId: string;
+    actions: AIToolAction[];
+  };
   error?: string;
   fallback?: string;
 }

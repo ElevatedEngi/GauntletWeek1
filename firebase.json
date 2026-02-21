@@ -7,6 +7,7 @@
     "rules": "database.rules.json"
   },
   "hosting": {
+    "site": "whiteboard-collab-98431547",
     "public": "apps/frontend/dist",
     "ignore": [
       "firebase.json",
@@ -14,6 +15,10 @@
       "**/node_modules/**"
     ],
     "rewrites": [
+      {
+        "source": "/api/**",
+        "function": "api"
+      },
       {
         "source": "**",
         "destination": "/index.html"

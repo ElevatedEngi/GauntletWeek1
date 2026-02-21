@@ -5,10 +5,9 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { CallbackHandler } from '@langfuse/langchain';
-import { createWhiteboardTools } from './tools.js';
-import type { ToolAction, PendingOperation } from './tools.js';
-import type { BoardObject } from '@whiteboard/shared-types';
+import { createWhiteboardTools } from './tools';
+import type { ToolAction, PendingOperation } from './tools';
+import type { BoardObject } from '../types';
 
 interface AICommandResponse {
   success: boolean;
@@ -41,14 +40,9 @@ Guidelines:
 export class AIAgent {
   private model: ChatAnthropic | null = null;
 
-  private getModel(): ChatAnthropic {
+  private getModel(apiKey: string): ChatAnthropic {
     if (this.model) {
       return this.model;
-    }
-
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY environment variable is not set');
     }
 
     this.model = new ChatAnthropic({
@@ -65,10 +59,11 @@ export class AIAgent {
     command: string,
     boardId: string,
     userId: string,
+    apiKey: string,
     boardObjects?: Record<string, BoardObject>,
   ): Promise<AICommandResponse> {
     try {
-      const model = this.getModel();
+      const model = this.getModel(apiKey);
       const { tools, actions, pendingOps } = createWhiteboardTools(
         boardId,
         userId,
@@ -82,19 +77,11 @@ export class AIAgent {
         new HumanMessage(command),
       ];
 
-      const langfuseHandler = new CallbackHandler({
-        sessionId: boardId,
-        userId,
-        metadata: { command },
-        tags: ['whiteboard-command'],
-      });
-
       let iterations = 0;
       while (iterations < MAX_ITERATIONS) {
         iterations++;
 
         const response = await modelWithTools.invoke(messages, {
-          callbacks: [langfuseHandler],
           metadata: {
             boardId,
             userId,
@@ -113,7 +100,6 @@ export class AIAgent {
               ? response.content
               : JSON.stringify(response.content);
 
-          await langfuseHandler.shutdownAsync();
           return {
             success: true,
             result: {
@@ -165,7 +151,6 @@ export class AIAgent {
         }
       }
 
-      await langfuseHandler.shutdownAsync();
       return {
         success: true,
         result: {
@@ -180,15 +165,6 @@ export class AIAgent {
         error instanceof Error ? error.message : 'Unknown error occurred';
 
       console.error('AI Command Error:', errorMessage);
-
-      if (errorMessage.includes('ANTHROPIC_API_KEY')) {
-        return {
-          success: false,
-          error: 'AI service is not configured',
-          fallback:
-            'Please configure the ANTHROPIC_API_KEY environment variable',
-        };
-      }
 
       return {
         success: false,
