@@ -1,23 +1,16 @@
 import { Request, Response, NextFunction } from 'express';
-import { initializeApp, getApps, cert } from 'firebase-admin/app';
+import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { Socket } from 'socket.io';
 
-// Initialize Firebase Admin SDK (once)
+// Initialize Firebase Admin SDK with just project ID (no service account key needed)
+// Firebase Admin can verify ID tokens using only the project ID by fetching
+// Google's public keys automatically.
 if (getApps().length === 0) {
-  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (serviceAccountJson) {
-    const serviceAccount = JSON.parse(serviceAccountJson);
-    initializeApp({
-      credential: cert(serviceAccount),
-      databaseURL: process.env.FIREBASE_DATABASE_URL,
-    });
-  } else {
-    // Falls back to GOOGLE_APPLICATION_CREDENTIALS env var or default credentials
-    initializeApp({
-      databaseURL: process.env.FIREBASE_DATABASE_URL,
-    });
-  }
+  initializeApp({
+    projectId: process.env.FIREBASE_PROJECT_ID || 'whiteboard-collab-98431547',
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
+  });
 }
 
 export interface AuthRequest extends Request {
