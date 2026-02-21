@@ -123,7 +123,7 @@ export class AIAgent {
               ? response.content
               : JSON.stringify(response.content);
 
-          if (langfuseHandler) await langfuseHandler.shutdownAsync();
+          if (langfuseHandler) try { await langfuseHandler.flushAsync?.(); } catch {}
           return {
             success: true,
             result: {
@@ -175,7 +175,7 @@ export class AIAgent {
         }
       }
 
-      if (langfuseHandler) await langfuseHandler.shutdownAsync();
+      if (langfuseHandler) try { await langfuseHandler.flushAsync?.(); } catch {}
       return {
         success: true,
         result: {
