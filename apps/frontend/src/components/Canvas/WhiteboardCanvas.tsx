@@ -89,6 +89,12 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
   const [selectedObjId, setSelectedObjId] = useState<string | null>(null);
   const [showColorPicker, setShowColorPicker] = useState(false);
 
+  // ── Multi-selection + group actions state ─────────────────────────────────
+  const [multiSelectedIds, setMultiSelectedIds] = useState<string[]>([]);
+  const [showGridPicker, setShowGridPicker] = useState(false);
+  const [gridCols, setGridCols] = useState(3);
+  const [gridGap, setGridGap] = useState(20);
+
   // ── Clipboard for copy/paste ───────────────────────────────────────────────
   const clipboardRef = useRef<BoardObject[]>([]);
 
@@ -1117,16 +1123,40 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     };
   }, [isConnecting, createConnector, cancelConnectionMode]);
 
-  // ── Selection tracking for color picker ────────────────────────────────────
+  // ── Selection tracking for color picker + multi-select ─────────────────────
   useEffect(() => {
     const canvas = fabricCanvasRef.current;
     if (!canvas) return;
 
     const onSelected = () => {
       const active = canvas.getActiveObject();
-      if (active?.data?.objectId) {
+      if (!active) {
+        setSelectedObjId(null);
+        setMultiSelectedIds([]);
+        setShowColorPicker(false);
+        setShowGridPicker(false);
+        return;
+      }
+
+      // Multi-select (ActiveSelection)
+      if (active.type === 'activeSelection') {
+        const group = active as fabric.ActiveSelection;
+        const ids = new Set<string>();
+        group.getObjects().forEach((obj) => {
+          if (obj.data?.objectId) ids.add(obj.data.objectId as string);
+        });
+        const idArray = Array.from(ids);
+        setMultiSelectedIds(idArray);
+        setSelectedObjId(null);
+        setShowColorPicker(false);
+        return;
+      }
+
+      // Single select
+      setMultiSelectedIds([]);
+      setShowGridPicker(false);
+      if (active.data?.objectId) {
         const objType = active.data.type as string;
-        // Only show color picker for shapes (including textbox shapes), not connectors/arrowheads
         if (objType === 'shape' || objType === 'text') {
           setSelectedObjId(active.data.objectId as string);
           return;
@@ -1138,7 +1168,9 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
 
     const onCleared = () => {
       setSelectedObjId(null);
+      setMultiSelectedIds([]);
       setShowColorPicker(false);
+      setShowGridPicker(false);
     };
 
     canvas.on('selection:created', onSelected);
@@ -1188,106 +1220,330 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
     setShowColorPicker(false);
   }, [selectedObjId, boardId, updateObjectStore]);
 
+  // ── Group actions helper: get BoardObject data for selected IDs ───────────
+  const getSelectedObjects = useCallback((): BoardObject[] => {
+    const store = useBoardStore.getState();
+    return multiSelectedIds
+      .map((id) => store.objects.get(id))
+      .filter((o): o is BoardObject => !!o && o.type !== ObjectType.CONNECTOR);
+  }, [multiSelectedIds]);
+
+  // Persist position update to store + Firebase
+  const syncObjectPosition = useCallback((obj: BoardObject) => {
+    const updates = { position: obj.position, updatedAt: Date.now() };
+    updateObjectStore(obj.id, updates);
+    const objRef = ref(realtimeDb, `boards/${boardId}/objects/${obj.id}`);
+    update(objRef, updates).catch(console.error);
+  }, [boardId, updateObjectStore]);
+
+  // Persist size update to store + Firebase
+  const syncObjectSize = useCallback((obj: BoardObject) => {
+    const updates = { width: obj.width, height: obj.height, updatedAt: Date.now() };
+    updateObjectStore(obj.id, updates);
+    const objRef = ref(realtimeDb, `boards/${boardId}/objects/${obj.id}`);
+    update(objRef, updates).catch(console.error);
+  }, [boardId, updateObjectStore]);
+
+  // Persist color update to store + Firebase
+  const syncObjectColor = useCallback((id: string, color: string) => {
+    updateObjectStore(id, { color });
+    const objRef = ref(realtimeDb, `boards/${boardId}/objects/${id}`);
+    update(objRef, { color, updatedAt: Date.now() }).catch(console.error);
+  }, [boardId, updateObjectStore]);
+
+  // Move canvas fabric objects to match store data
+  const refreshCanvasPositions = useCallback(() => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+    const store = useBoardStore.getState();
+    canvas.getObjects().forEach((fObj) => {
+      const oid = fObj.data?.objectId as string | undefined;
+      if (!oid || fObj.data?.type !== 'shape') return;
+      const objData = store.objects.get(oid);
+      if (!objData) return;
+      fObj.set({
+        left: objData.position.x + objData.width / 2,
+        top: objData.position.y + objData.height / 2,
+        width: objData.width,
+        height: objData.height,
+        scaleX: 1,
+        scaleY: 1,
+      });
+      fObj.setCoords();
+    });
+    canvas.discardActiveObject();
+    canvas.requestRenderAll();
+  }, []);
+
+  // ── Alignment actions ─────────────────────────────────────────────────────
+  const alignObjects = useCallback((direction: 'left' | 'right' | 'top' | 'bottom' | 'center-h' | 'center-v') => {
+    const objs = getSelectedObjects();
+    if (objs.length < 2) return;
+
+    let anchor: number;
+    switch (direction) {
+      case 'left':
+        anchor = Math.min(...objs.map((o) => o.position.x));
+        objs.forEach((o) => { o.position = { ...o.position, x: anchor }; });
+        break;
+      case 'right':
+        anchor = Math.max(...objs.map((o) => o.position.x + o.width));
+        objs.forEach((o) => { o.position = { ...o.position, x: anchor - o.width }; });
+        break;
+      case 'top':
+        anchor = Math.min(...objs.map((o) => o.position.y));
+        objs.forEach((o) => { o.position = { ...o.position, y: anchor }; });
+        break;
+      case 'bottom':
+        anchor = Math.max(...objs.map((o) => o.position.y + o.height));
+        objs.forEach((o) => { o.position = { ...o.position, y: anchor - o.height }; });
+        break;
+      case 'center-h': {
+        const minX = Math.min(...objs.map((o) => o.position.x));
+        const maxX = Math.max(...objs.map((o) => o.position.x + o.width));
+        const centerX = (minX + maxX) / 2;
+        objs.forEach((o) => { o.position = { ...o.position, x: centerX - o.width / 2 }; });
+        break;
+      }
+      case 'center-v': {
+        const minY = Math.min(...objs.map((o) => o.position.y));
+        const maxY = Math.max(...objs.map((o) => o.position.y + o.height));
+        const centerY = (minY + maxY) / 2;
+        objs.forEach((o) => { o.position = { ...o.position, y: centerY - o.height / 2 }; });
+        break;
+      }
+    }
+    objs.forEach(syncObjectPosition);
+    refreshCanvasPositions();
+  }, [getSelectedObjects, syncObjectPosition, refreshCanvasPositions]);
+
+  // ── Distribute evenly ──────────────────────────────────────────────────────
+  const distributeObjects = useCallback((axis: 'horizontal' | 'vertical') => {
+    const objs = getSelectedObjects();
+    if (objs.length < 3) return;
+
+    if (axis === 'horizontal') {
+      objs.sort((a, b) => a.position.x - b.position.x);
+      const totalWidth = objs.reduce((s, o) => s + o.width, 0);
+      const minX = objs[0].position.x;
+      const maxX = objs[objs.length - 1].position.x + objs[objs.length - 1].width;
+      const gap = (maxX - minX - totalWidth) / (objs.length - 1);
+      let cursor = minX;
+      objs.forEach((o) => {
+        o.position = { ...o.position, x: cursor };
+        cursor += o.width + gap;
+      });
+    } else {
+      objs.sort((a, b) => a.position.y - b.position.y);
+      const totalHeight = objs.reduce((s, o) => s + o.height, 0);
+      const minY = objs[0].position.y;
+      const maxY = objs[objs.length - 1].position.y + objs[objs.length - 1].height;
+      const gap = (maxY - minY - totalHeight) / (objs.length - 1);
+      let cursor = minY;
+      objs.forEach((o) => {
+        o.position = { ...o.position, y: cursor };
+        cursor += o.height + gap;
+      });
+    }
+    objs.forEach(syncObjectPosition);
+    refreshCanvasPositions();
+  }, [getSelectedObjects, syncObjectPosition, refreshCanvasPositions]);
+
+  // ── Match size ─────────────────────────────────────────────────────────────
+  const matchSize = useCallback((dimension: 'width' | 'height' | 'both') => {
+    const objs = getSelectedObjects();
+    if (objs.length < 2) return;
+    // Use the first selected object as the reference
+    const refObj = objs[0];
+    objs.forEach((o) => {
+      if (dimension === 'width' || dimension === 'both') o.width = refObj.width;
+      if (dimension === 'height' || dimension === 'both') o.height = refObj.height;
+    });
+    objs.forEach(syncObjectSize);
+    refreshCanvasPositions();
+  }, [getSelectedObjects, syncObjectSize, refreshCanvasPositions]);
+
+  // ── Apply color to all selected ────────────────────────────────────────────
+  const applyColorToGroup = useCallback((color: string) => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+    const objs = getSelectedObjects();
+    objs.forEach((o) => {
+      syncObjectColor(o.id, color);
+      // Update fabric objects visually
+      canvas.getObjects().forEach((fObj) => {
+        if (fObj.data?.objectId === o.id && fObj.data?.type === 'shape') {
+          if (o.type === ObjectType.TEXT_BOX) {
+            (fObj as fabric.Textbox).set({ fill: color });
+          } else {
+            fObj.set({ fill: color });
+          }
+        }
+      });
+    });
+    canvas.requestRenderAll();
+    setShowColorPicker(false);
+  }, [getSelectedObjects, syncObjectColor]);
+
+  // ── Grid reformat ──────────────────────────────────────────────────────────
+  const reformatAsGrid = useCallback((cols: number, gap: number) => {
+    const objs = getSelectedObjects();
+    if (objs.length < 2) return;
+
+    // Sort by current position (top-left reading order)
+    objs.sort((a, b) => {
+      const rowA = Math.round(a.position.y / 50);
+      const rowB = Math.round(b.position.y / 50);
+      if (rowA !== rowB) return rowA - rowB;
+      return a.position.x - b.position.x;
+    });
+
+    // Use median width/height as cell size for uniform grid
+    const widths = objs.map((o) => o.width).sort((a, b) => a - b);
+    const heights = objs.map((o) => o.height).sort((a, b) => a - b);
+    const cellW = widths[Math.floor(widths.length / 2)];
+    const cellH = heights[Math.floor(heights.length / 2)];
+
+    // Start position: use the top-left-most object's position
+    const startX = Math.min(...objs.map((o) => o.position.x));
+    const startY = Math.min(...objs.map((o) => o.position.y));
+
+    objs.forEach((o, i) => {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      o.position = {
+        x: startX + col * (cellW + gap),
+        y: startY + row * (cellH + gap),
+      };
+      // Optionally resize to uniform cell size
+      o.width = cellW;
+      o.height = cellH;
+    });
+
+    objs.forEach((o) => { syncObjectPosition(o); syncObjectSize(o); });
+    refreshCanvasPositions();
+    setShowGridPicker(false);
+  }, [getSelectedObjects, syncObjectPosition, syncObjectSize, refreshCanvasPositions]);
+
   return (
     <div ref={containerRef} tabIndex={-1} className="w-full h-full flex flex-col bg-white outline-none">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 p-4 border-b border-gray-200 bg-gray-50">
-        <button
-          onClick={() => createObject('sticky_note')}
-          disabled={!canvasReady}
-          className="px-3 py-2 bg-yellow-200 text-gray-900 rounded hover:bg-yellow-300 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium"
-          title="Create sticky note"
-        >
-          📝 Sticky Note
-        </button>
+      <div className="flex items-center gap-1 px-3 py-2 border-b border-gray-200 bg-gray-50">
+        {/* ── Shapes Section ── */}
+        <div className="flex items-center gap-1 bg-white rounded-lg border border-gray-200 px-2 py-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mr-1 select-none">Shapes</span>
+          <button
+            onClick={() => createObject('sticky_note')}
+            disabled={!canvasReady}
+            className="px-2.5 py-1.5 bg-yellow-100 text-gray-800 rounded hover:bg-yellow-200 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs font-medium"
+            title="Create sticky note"
+          >
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/></svg>
+              Sticky
+            </span>
+          </button>
+          <button
+            onClick={() => createObject('rectangle')}
+            disabled={!canvasReady}
+            className="px-2.5 py-1.5 bg-blue-100 text-gray-800 rounded hover:bg-blue-200 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs font-medium"
+            title="Create rectangle"
+          >
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="5" width="18" height="14" rx="1"/></svg>
+              Rect
+            </span>
+          </button>
+          <button
+            onClick={() => createObject('circle')}
+            disabled={!canvasReady}
+            className="px-2.5 py-1.5 bg-green-100 text-gray-800 rounded hover:bg-green-200 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs font-medium"
+            title="Create circle"
+          >
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="9"/></svg>
+              Circle
+            </span>
+          </button>
+          <button
+            onClick={() => createObject('frame')}
+            disabled={!canvasReady}
+            className="px-2.5 py-1.5 bg-slate-100 text-gray-800 rounded hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs font-medium border border-dashed border-slate-300"
+            title="Create a frame to group objects"
+          >
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="4 2"><rect x="3" y="3" width="18" height="18" rx="1"/></svg>
+              Frame
+            </span>
+          </button>
+        </div>
 
-        <button
-          onClick={() => createObject('rectangle')}
-          disabled={!canvasReady}
-          className="px-3 py-2 bg-blue-200 text-gray-900 rounded hover:bg-blue-300 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium"
-          title="Create rectangle"
-        >
-          ▭ Rectangle
-        </button>
+        {/* ── Connectors Section ── */}
+        <div className="flex items-center gap-1 bg-white rounded-lg border border-gray-200 px-2 py-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mr-1 select-none">Connect</span>
+          <button
+            onClick={() => startConnectionMode('line')}
+            disabled={!canvasReady}
+            className={`px-2.5 py-1.5 rounded transition text-xs font-medium flex items-center gap-1 ${
+              isConnecting && connectionStyleRef.current === 'line'
+                ? 'bg-orange-500 text-white'
+                : 'bg-orange-50 text-gray-800 hover:bg-orange-100'
+            } disabled:opacity-40 disabled:cursor-not-allowed`}
+            title="Connect two objects with a line"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Line
+          </button>
+          <button
+            onClick={() => startConnectionMode('arrow')}
+            disabled={!canvasReady}
+            className={`px-2.5 py-1.5 rounded transition text-xs font-medium flex items-center gap-1 ${
+              isConnecting && connectionStyleRef.current === 'arrow'
+                ? 'bg-orange-500 text-white'
+                : 'bg-orange-50 text-gray-800 hover:bg-orange-100'
+            } disabled:opacity-40 disabled:cursor-not-allowed`}
+            title="Connect two objects with an arrow"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="15 8 19 12 15 16"/></svg>
+            Arrow
+          </button>
+        </div>
 
-        <button
-          onClick={() => createObject('circle')}
-          disabled={!canvasReady}
-          className="px-3 py-2 bg-green-200 text-gray-900 rounded hover:bg-green-300 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium"
-          title="Create circle"
-        >
-          ● Circle
-        </button>
+        {/* ── Text Section ── */}
+        <div className="flex items-center gap-1 bg-white rounded-lg border border-gray-200 px-2 py-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mr-1 select-none">Text</span>
+          <button
+            onClick={() => createObject('text_box')}
+            disabled={!canvasReady}
+            className="px-2.5 py-1.5 bg-violet-50 text-gray-800 rounded hover:bg-violet-100 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs font-medium"
+            title="Create text box — resize to scale text"
+          >
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 7V4h16v3"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="8" y1="20" x2="16" y2="20"/></svg>
+              Text Box
+            </span>
+          </button>
+          <button
+            onClick={() => createObject('arrow')}
+            disabled={!canvasReady}
+            className="px-2.5 py-1.5 bg-violet-50 text-gray-800 rounded hover:bg-violet-100 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs font-medium"
+            title="Create arrow shape"
+          >
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+              Arrow
+            </span>
+          </button>
+        </div>
 
-        <button
-          onClick={() => createObject('arrow')}
-          disabled={!canvasReady}
-          className="px-3 py-2 bg-purple-200 text-gray-900 rounded hover:bg-purple-300 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium"
-          title="Create arrow"
-        >
-          ➜ Arrow
-        </button>
-
-        <button
-          onClick={() => createObject('text_box')}
-          disabled={!canvasReady}
-          className="px-3 py-2 bg-gray-200 text-gray-900 rounded hover:bg-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium"
-          title="Create text box — resize to scale text"
-        >
-          Aa Text
-        </button>
-
-        {/* Separator */}
-        <div className="w-px h-6 bg-gray-300 mx-1" />
-
-        {/* Connect buttons */}
-        <button
-          onClick={() => startConnectionMode('line')}
-          disabled={!canvasReady}
-          className={`px-3 py-2 rounded transition text-sm font-medium ${
-            isConnecting && connectionStyleRef.current === 'line'
-              ? 'bg-orange-500 text-white'
-              : 'bg-orange-200 text-gray-900 hover:bg-orange-300'
-          } disabled:opacity-40 disabled:cursor-not-allowed`}
-          title="Connect two objects with a line"
-        >
-          ─ Line
-        </button>
-
-        <button
-          onClick={() => startConnectionMode('arrow')}
-          disabled={!canvasReady}
-          className={`px-3 py-2 rounded transition text-sm font-medium ${
-            isConnecting && connectionStyleRef.current === 'arrow'
-              ? 'bg-orange-500 text-white'
-              : 'bg-orange-200 text-gray-900 hover:bg-orange-300'
-          } disabled:opacity-40 disabled:cursor-not-allowed`}
-          title="Connect two objects with an arrow"
-        >
-          → Arrow
-        </button>
-
-        {/* Separator */}
-        <div className="w-px h-6 bg-gray-300 mx-1" />
-
-        {/* Frame button */}
-        <button
-          onClick={() => createObject('frame')}
-          disabled={!canvasReady}
-          className="px-3 py-2 bg-blue-100 text-blue-800 rounded hover:bg-blue-200 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium border border-blue-300 border-dashed"
-          title="Create a frame to group objects"
-        >
-          [ ] Frame
-        </button>
-
-        {/* Color picker — visible when an object is selected */}
+        {/* ── Color Picker (selection-dependent) ── */}
         {selectedObjId && (
-          <>
-            <div className="w-px h-6 bg-gray-300 mx-1" />
+          <div className="flex items-center gap-1 bg-white rounded-lg border border-gray-200 px-2 py-1">
+            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mr-1 select-none">Style</span>
             <div className="relative">
               <button
                 onClick={() => setShowColorPicker((v) => !v)}
-                className="px-3 py-2 bg-white border border-gray-300 rounded hover:bg-gray-100 transition text-sm font-medium flex items-center gap-1.5"
+                className="px-2.5 py-1.5 bg-white border border-gray-300 rounded hover:bg-gray-50 transition text-xs font-medium flex items-center gap-1.5"
                 title="Change color"
               >
                 <span
@@ -1310,21 +1566,155 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ── Group Actions (multi-select only) ── */}
+        {multiSelectedIds.length >= 2 && (
+          <>
+            {/* Align */}
+            <div className="flex items-center gap-0.5 bg-white rounded-lg border border-indigo-200 px-2 py-1">
+              <span className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider mr-1 select-none">Align</span>
+              <button onClick={() => alignObjects('left')} className="p-1 rounded hover:bg-indigo-50 transition" title="Align left">
+                <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="4" y1="4" x2="4" y2="20"/><rect x="8" y="6" width="12" height="4" rx="1"/><rect x="8" y="14" width="8" height="4" rx="1"/></svg>
+              </button>
+              <button onClick={() => alignObjects('center-h')} className="p-1 rounded hover:bg-indigo-50 transition" title="Align center horizontal">
+                <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="2" x2="12" y2="22"/><rect x="6" y="5" width="12" height="4" rx="1"/><rect x="8" y="15" width="8" height="4" rx="1"/></svg>
+              </button>
+              <button onClick={() => alignObjects('right')} className="p-1 rounded hover:bg-indigo-50 transition" title="Align right">
+                <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="20" y1="4" x2="20" y2="20"/><rect x="4" y="6" width="12" height="4" rx="1"/><rect x="8" y="14" width="8" height="4" rx="1"/></svg>
+              </button>
+              <div className="w-px h-4 bg-indigo-200 mx-0.5" />
+              <button onClick={() => alignObjects('top')} className="p-1 rounded hover:bg-indigo-50 transition" title="Align top">
+                <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="4" y1="4" x2="20" y2="4"/><rect x="6" y="8" width="4" height="12" rx="1"/><rect x="14" y="8" width="4" height="8" rx="1"/></svg>
+              </button>
+              <button onClick={() => alignObjects('center-v')} className="p-1 rounded hover:bg-indigo-50 transition" title="Align center vertical">
+                <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="2" y1="12" x2="22" y2="12"/><rect x="5" y="6" width="4" height="12" rx="1"/><rect x="15" y="8" width="4" height="8" rx="1"/></svg>
+              </button>
+              <button onClick={() => alignObjects('bottom')} className="p-1 rounded hover:bg-indigo-50 transition" title="Align bottom">
+                <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="4" y1="20" x2="20" y2="20"/><rect x="6" y="4" width="4" height="12" rx="1"/><rect x="14" y="8" width="4" height="8" rx="1"/></svg>
+              </button>
+            </div>
+
+            {/* Distribute + Match Size */}
+            <div className="flex items-center gap-0.5 bg-white rounded-lg border border-indigo-200 px-2 py-1">
+              <span className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider mr-1 select-none">Layout</span>
+              <button onClick={() => distributeObjects('horizontal')} className="p-1 rounded hover:bg-indigo-50 transition text-[10px] font-medium text-indigo-600" title="Distribute evenly horizontal">
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="8" width="4" height="8" rx="1"/><rect x="10" y="8" width="4" height="8" rx="1"/><rect x="18" y="8" width="4" height="8" rx="1"/></svg>
+              </button>
+              <button onClick={() => distributeObjects('vertical')} className="p-1 rounded hover:bg-indigo-50 transition text-[10px] font-medium text-indigo-600" title="Distribute evenly vertical">
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="8" y="2" width="8" height="4" rx="1"/><rect x="8" y="10" width="8" height="4" rx="1"/><rect x="8" y="18" width="8" height="4" rx="1"/></svg>
+              </button>
+              <div className="w-px h-4 bg-indigo-200 mx-0.5" />
+              <button onClick={() => matchSize('width')} className="px-1.5 py-0.5 rounded hover:bg-indigo-50 transition text-[10px] font-medium text-indigo-600" title="Match width to first selected">W</button>
+              <button onClick={() => matchSize('height')} className="px-1.5 py-0.5 rounded hover:bg-indigo-50 transition text-[10px] font-medium text-indigo-600" title="Match height to first selected">H</button>
+              <button onClick={() => matchSize('both')} className="px-1.5 py-0.5 rounded hover:bg-indigo-50 transition text-[10px] font-medium text-indigo-600" title="Match both dimensions to first selected">WH</button>
+            </div>
+
+            {/* Grid Reformat */}
+            <div className="flex items-center gap-1 bg-white rounded-lg border border-indigo-200 px-2 py-1 relative">
+              <span className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider mr-1 select-none">Grid</span>
+              <button
+                onClick={() => setShowGridPicker((v) => !v)}
+                className={`px-2 py-1 rounded transition text-[10px] font-medium flex items-center gap-1 ${
+                  showGridPicker ? 'bg-indigo-500 text-white' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+                }`}
+                title="Reformat selection into a grid"
+              >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                Arrange
+              </button>
+
+              {showGridPicker && (
+                <div className="absolute top-full left-0 mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg p-3 w-52">
+                  <p className="text-[11px] font-semibold text-gray-700 mb-2">Arrange {multiSelectedIds.length} objects in grid</p>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[10px] text-gray-500 font-medium">Columns</label>
+                      <div className="flex items-center gap-1">
+                        {[2, 3, 4, 5, 6].map((n) => (
+                          <button
+                            key={n}
+                            onClick={() => setGridCols(n)}
+                            className={`w-6 h-6 rounded text-[10px] font-semibold transition ${
+                              gridCols === n ? 'bg-indigo-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                            }`}
+                          >
+                            {n}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-[10px] text-gray-500 font-medium">Gap (px)</label>
+                      <input
+                        type="range"
+                        min={0}
+                        max={60}
+                        step={5}
+                        value={gridGap}
+                        onChange={(e) => setGridGap(Number(e.target.value))}
+                        className="w-20 h-1 accent-indigo-500"
+                      />
+                      <span className="text-[10px] text-gray-500 w-6 text-right">{gridGap}</span>
+                    </div>
+                    {/* Preview: show rows x cols */}
+                    <div className="text-[10px] text-gray-400 text-center">
+                      {Math.ceil(multiSelectedIds.length / gridCols)} rows x {gridCols} cols
+                    </div>
+                    <button
+                      onClick={() => reformatAsGrid(gridCols, gridGap)}
+                      className="w-full py-1.5 bg-indigo-600 text-white text-xs font-medium rounded hover:bg-indigo-700 transition"
+                    >
+                      Apply Grid
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Group Color */}
+            <div className="flex items-center gap-1 bg-white rounded-lg border border-indigo-200 px-2 py-1 relative">
+              <span className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider mr-1 select-none">Color</span>
+              <button
+                onClick={() => setShowColorPicker((v) => !v)}
+                className="px-2 py-1 bg-white border border-gray-300 rounded hover:bg-gray-50 transition text-[10px] font-medium flex items-center gap-1"
+                title="Apply color to all selected"
+              >
+                <span className="inline-block w-3 h-3 rounded border border-gray-400 bg-gradient-to-br from-red-200 via-blue-200 to-green-200" />
+                All
+              </button>
+              {showColorPicker && (
+                <div className="absolute top-full left-0 mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg p-2 grid grid-cols-5 gap-1 w-40">
+                  {COLOR_PALETTE.map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => applyColorToGroup(c)}
+                      className="w-6 h-6 rounded border border-gray-300 hover:scale-110 transition-transform"
+                      style={{ backgroundColor: c }}
+                      title={c}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="text-[10px] text-indigo-400 font-medium select-none">{multiSelectedIds.length} selected</div>
           </>
         )}
 
         <div className="flex-1" />
 
-        {/* Live canvas coordinates — updated via DOM ref (no React re-render) */}
+        {/* ── View Controls ── */}
         <span
           ref={coordsDisplayRef}
-          className="text-xs text-gray-400 font-mono w-28 text-right select-none"
+          className="text-[10px] text-gray-400 font-mono w-24 text-right select-none"
         >
           X:0  Y:0
         </span>
 
-        <div className="text-sm text-gray-600 ml-2">
-          Zoom: {(canvasState.scale * 100).toFixed(0)}%
+        <div className="text-xs text-gray-500 ml-1">
+          {(canvasState.scale * 100).toFixed(0)}%
         </div>
 
         <button
@@ -1342,9 +1732,9 @@ const WhiteboardCanvas: React.FC<WhiteboardCanvasProps> = ({ boardId }) => {
             }
             if (coordsDisplayRef.current) coordsDisplayRef.current.textContent = 'X:0  Y:0';
           }}
-          className="px-3 py-2 bg-gray-200 text-gray-900 rounded hover:bg-gray-300 transition text-sm font-medium"
+          className="px-2 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 transition text-xs font-medium"
         >
-          Reset View
+          Reset
         </button>
       </div>
 
