@@ -239,6 +239,39 @@ const TEMPLATE_MATCHERS: TemplateMatch[] = [
 ];
 
 /**
+ * Returns a human-readable preview if the command matches a template.
+ * Used for the confirmation dialog — no objects are created.
+ */
+export function getTemplatePreview(
+  command: string,
+): { matched: true; name: string; description: string; objectCount: number } | null {
+  const previews: Record<string, { name: string; description: string; objectCount: number }> = {
+    swot: { name: 'SWOT Analysis', description: 'Creates a 4-quadrant SWOT grid (Strengths, Weaknesses, Opportunities, Threats) with colored sections and labels.', objectCount: 8 },
+    kanban: { name: 'Kanban Board', description: 'Creates a 4-column Kanban board (To Do, In Progress, Review, Done) with colored columns and headers.', objectCount: 8 },
+    proscons: { name: 'Pros & Cons', description: 'Creates a 2-column Pros and Cons comparison layout with green and red sections.', objectCount: 4 },
+    timeline: { name: 'Timeline', description: 'Creates a horizontal timeline with 5 milestone markers and labels.', objectCount: 11 },
+    eisenhower: { name: 'Eisenhower Matrix', description: 'Creates a 4-quadrant priority matrix (Urgent/Important, Not Urgent/Important, etc.) with colored sections.', objectCount: 8 },
+    brainstorm: { name: 'Brainstorm Grid', description: 'Creates a 3x2 grid of 6 colorful sticky notes for brainstorming ideas.', objectCount: 6 },
+  };
+
+  for (const { pattern } of TEMPLATE_MATCHERS) {
+    if (pattern.test(command)) {
+      const key = pattern.source.includes('swot') ? 'swot'
+        : pattern.source.includes('kanban') ? 'kanban'
+        : pattern.source.includes('pros') ? 'proscons'
+        : pattern.source.includes('timeline') ? 'timeline'
+        : pattern.source.includes('eisenhower') ? 'eisenhower'
+        : pattern.source.includes('brain') ? 'brainstorm'
+        : null;
+      if (key && previews[key]) {
+        return { matched: true, ...previews[key] };
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Try to match the command to a pre-built template.
  * Returns null if no template matches — caller should fall back to the LLM.
  */

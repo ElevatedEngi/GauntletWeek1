@@ -225,6 +225,42 @@ export class AIAgent {
       };
     }
   }
+  async previewCommand(
+    command: string,
+    boardId: string,
+    boardObjects?: Record<string, BoardObject>,
+  ): Promise<{ plan: string; objectCount: number }> {
+    const model = this.getModel();
+
+    const previewModel = new ChatAnthropic({
+      modelName: 'claude-sonnet-4-20250514',
+      anthropicApiKey: model.apiKey as string,
+      maxTokens: 200,
+      temperature: 0,
+    });
+
+    const existingCount = boardObjects ? Object.keys(boardObjects).length : 0;
+
+    const response = await previewModel.invoke([
+      new SystemMessage(
+        `You are a whiteboard assistant. The user wants to perform an action on a whiteboard that currently has ${existingCount} objects.
+Describe in 1-2 SHORT sentences what you will create/modify. Include the approximate number of objects.
+Format: "I'll create [description]. This will add ~[N] objects to the board."
+Do NOT use tools. Do NOT execute anything. Just describe the plan.`,
+      ),
+      new HumanMessage(command),
+    ]);
+
+    const plan =
+      typeof response.content === 'string'
+        ? response.content
+        : JSON.stringify(response.content);
+
+    const countMatch = plan.match(/~?(\d+)\s*object/i);
+    const objectCount = countMatch ? parseInt(countMatch[1], 10) : 0;
+
+    return { plan, objectCount };
+  }
 }
 
 export const aiAgent = new AIAgent();
