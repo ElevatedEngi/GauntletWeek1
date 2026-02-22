@@ -433,6 +433,62 @@ export function createWhiteboardTools(
     },
   );
 
+  // --- Tool 11: createMultipleObjects (batch) ---
+  const createMultipleObjects = tool(
+    async ({ objects: objDefs }) => {
+      const createdIds: string[] = [];
+      for (const def of objDefs) {
+        const id = uuidv4();
+        const objType =
+          def.type === 'sticky_note' ? ObjectType.STICKY_NOTE
+          : def.type === 'rectangle' ? ObjectType.RECTANGLE
+          : def.type === 'circle' ? ObjectType.CIRCLE
+          : def.type === 'text_box' ? ObjectType.TEXT_BOX
+          : def.type === 'arrow' ? ObjectType.ARROW
+          : ObjectType.STICKY_NOTE;
+
+        const obj: BoardObject = {
+          id,
+          type: objType,
+          position: { x: def.x, y: def.y },
+          width: def.width || 150,
+          height: def.height || 100,
+          rotation: 0,
+          content: def.content || '',
+          color: def.color || '#FEF3C7',
+          userId,
+          fontSize: def.fontSize,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        pendingOps.push({ type: 'create', object: obj });
+        createdIds.push(id);
+      }
+      actions.push({
+        tool: 'createMultipleObjects',
+        description: `Created ${objDefs.length} objects in batch`,
+      });
+      return JSON.stringify({ success: true, count: objDefs.length, objectIds: createdIds });
+    },
+    {
+      name: 'createMultipleObjects',
+      description:
+        'Create multiple objects at once in a single batch call. Much faster than creating them one by one. Use this when you need to create 2+ objects.',
+      schema: z.object({
+        objects: z.array(z.object({
+          type: z.enum(['sticky_note', 'rectangle', 'circle', 'text_box', 'arrow']).describe('Object type'),
+          x: z.number().describe('X position'),
+          y: z.number().describe('Y position'),
+          width: z.number().optional().describe('Width (default 150)'),
+          height: z.number().optional().describe('Height (default 100)'),
+          content: z.string().optional().describe('Text content'),
+          color: z.string().optional().describe('Color hex (default #FEF3C7)'),
+          fontSize: z.number().optional().describe('Font size for text_box'),
+        })).describe('Array of objects to create'),
+      }),
+    },
+  );
+
   const allTools = [
     createStickyNote,
     createShape,
@@ -444,6 +500,7 @@ export function createWhiteboardTools(
     changeColor,
     getBoardState,
     createSWOTAnalysis,
+    createMultipleObjects,
   ];
 
   return { tools: allTools, actions, pendingOps };

@@ -7,6 +7,7 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import { createWhiteboardTools } from './tools.js';
 import type { ToolAction, PendingOperation } from './tools.js';
+import { tryTemplateMatch } from './templates.js';
 import type { BoardObject } from '@whiteboard/shared-types';
 
 interface AICommandResponse {
@@ -29,13 +30,17 @@ You can create and manipulate objects on the whiteboard using the tools provided
 When a user asks you to do something on the whiteboard, USE THE TOOLS to actually do it.
 Do not just describe what you would do — actually call the tools to make changes.
 
+CRITICAL FOR SPEED:
+- ALWAYS call ALL tools in a SINGLE turn when possible. For example, if creating 5 sticky notes, call createStickyNote 5 times in ONE response, not 5 separate turns.
+- When creating multiple objects, prefer the createMultipleObjects batch tool — it creates many objects in a single call.
+- Use createSWOTAnalysis, createMultipleObjects, or other composite tools whenever applicable to minimize round-trips.
+
 Guidelines:
 - For positioning: The canvas uses pixel coordinates starting at (0,0) top-left. Use positions in the 100-800 range for x and 100-600 range for y. Space objects at least 170px apart horizontally and 120px apart vertically.
 - For colors: Use pastel hex colors. Common options: yellow #FEF3C7, red #FEE2E2, green #DCFCE7, blue #DBEAFE, purple #E9D5FF, gray #F3F4F6
 - When asked to do a SWOT analysis, use the createSWOTAnalysis tool.
 - When you need context about what's on the board, call getBoardState first.
-- After performing actions, give a brief summary of what you did.
-- You can call multiple tools in a single turn to be efficient.`;
+- After performing actions, give a brief summary of what you did.`;
 
 export class AIAgent {
   private model: ChatAnthropic | null = null;
@@ -65,7 +70,15 @@ export class AIAgent {
     boardId: string,
     userId: string,
     boardObjects?: Record<string, BoardObject>,
+    onProgress?: (ops: PendingOperation[]) => void,
   ): Promise<AICommandResponse> {
+    // Fast-path: check if command matches a pre-built template
+    const templateResult = tryTemplateMatch(command, boardId, userId);
+    if (templateResult) {
+      console.log(`[AI] Template fast-path matched for: "${command}"`);
+      return templateResult;
+    }
+
     try {
       const model = this.getModel();
       const { tools, actions, pendingOps } = createWhiteboardTools(
@@ -172,6 +185,11 @@ export class AIAgent {
               }),
             );
           }
+        }
+
+        // Stream new operations to the frontend as they're created
+        if (onProgress && pendingOps.length > 0) {
+          onProgress(pendingOps.slice());
         }
       }
 

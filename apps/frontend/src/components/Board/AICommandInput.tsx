@@ -31,18 +31,103 @@ const AICommandInput: React.FC<AICommandInputProps> = ({ boardId }) => {
 
     for (const op of operations) {
       if (op.type === 'create' && op.object) {
-        // Add to Zustand store for immediate rendering
         store.addObject(op.object);
-        // Write to Firebase RTDB
         const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${op.object.id}`);
         set(objectRef, op.object).catch(console.error);
       } else if (op.type === 'update' && op.objectId && op.updates) {
-        // Update Zustand store
         store.updateObject(op.objectId, op.updates);
-        // Update Firebase RTDB
         const objectRef = ref(realtimeDb, `boards/${boardId}/objects/${op.objectId}`);
         update(objectRef, op.updates).catch(console.error);
       }
+    }
+  };
+
+  const handleSubmitStream = async (token: string, boardObjects: Record<string, BoardObject>) => {
+    const apiUrl = import.meta.env.VITE_API_URL || '';
+    const response = await fetch(`${apiUrl}/api/ai/execute-command-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ command, boardId, boardObjects }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to execute command');
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('No response stream');
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalResult: { message?: string; actions?: ToolAction[]; operations?: PendingOperation[] } | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const jsonStr = line.slice(6).trim();
+        if (!jsonStr) continue;
+
+        try {
+          const event = JSON.parse(jsonStr);
+
+          if (event.type === 'operations') {
+            // Render objects immediately as they arrive
+            await executeOperations(event.operations);
+            setResult(`Creating objects... (${event.operations.length} new)`);
+          } else if (event.type === 'done' && event.result) {
+            finalResult = event.result.result || event.result;
+            // Execute any remaining operations not already streamed
+            const ops: PendingOperation[] = finalResult?.operations || (event.result.result?.operations) || [];
+            if (ops.length > 0) {
+              await executeOperations(ops);
+            }
+          } else if (event.type === 'error') {
+            throw new Error(event.error || 'Stream error');
+          }
+        } catch (parseErr) {
+          // Ignore SSE parse errors for partial data
+        }
+      }
+    }
+
+    return finalResult;
+  };
+
+  const handleSubmitFallback = async (token: string, boardObjects: Record<string, BoardObject>) => {
+    const apiUrl = import.meta.env.VITE_API_URL || '';
+    const response = await fetch(`${apiUrl}/api/ai/execute-command`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ command, boardId, boardObjects }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to execute command');
+    }
+
+    const data = await response.json();
+
+    if (data.success && data.result) {
+      const operations: PendingOperation[] = data.result.operations || [];
+      if (operations.length > 0) {
+        await executeOperations(operations);
+      }
+      return data.result;
+    } else {
+      throw new Error(data.error || 'Command failed');
     }
   };
 
@@ -54,7 +139,6 @@ const AICommandInput: React.FC<AICommandInputProps> = ({ boardId }) => {
     setResult(null);
 
     try {
-      // Gather current board objects for AI context
       const storeObjects = useBoardStore.getState().objects;
       const boardObjects: Record<string, BoardObject> = {};
       storeObjects.forEach((obj, id) => {
@@ -68,31 +152,18 @@ const AICommandInput: React.FC<AICommandInputProps> = ({ boardId }) => {
       }
 
       const token = await auth.currentUser.getIdToken();
-      const apiUrl = import.meta.env.VITE_API_URL || '';
-      const response = await fetch(`${apiUrl}/api/ai/execute-command`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ command, boardId, boardObjects }),
-      });
 
-      if (!response.ok) {
-        throw new Error('Failed to execute command');
+      // Try streaming first, fall back to standard request
+      let finalResult: any;
+      try {
+        finalResult = await handleSubmitStream(token, boardObjects);
+      } catch {
+        finalResult = await handleSubmitFallback(token, boardObjects);
       }
 
-      const data = await response.json();
-
-      if (data.success && data.result) {
-        // Execute pending operations on Firebase
-        const operations: PendingOperation[] = data.result.operations || [];
-        if (operations.length > 0) {
-          await executeOperations(operations);
-        }
-
-        const message = data.result.message || 'Command executed';
-        const actions: ToolAction[] = data.result.actions || [];
+      if (finalResult) {
+        const message = finalResult.message || 'Command executed';
+        const actions: ToolAction[] = finalResult.actions || [];
         if (actions.length > 0) {
           const actionLines = actions
             .map((a: ToolAction) => `  - ${a.description}`)
@@ -101,14 +172,12 @@ const AICommandInput: React.FC<AICommandInputProps> = ({ boardId }) => {
         } else {
           setResult(message);
         }
-      } else {
-        setResult(`Error: ${data.error || 'Command failed'}`);
       }
 
       setCommand('');
     } catch (error) {
       console.error('Failed to execute command:', error);
-      setResult('Error: Failed to execute command');
+      setResult(`Error: ${error instanceof Error ? error.message : 'Failed to execute command'}`);
     } finally {
       setIsLoading(false);
     }
@@ -130,7 +199,7 @@ const AICommandInput: React.FC<AICommandInputProps> = ({ boardId }) => {
         disabled={isLoading || !command.trim()}
         className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium py-2 px-4 rounded-lg transition"
       >
-        {isLoading ? 'Executing...' : 'Execute'}
+        {isLoading ? 'Generating...' : 'Execute'}
       </button>
       {result && (
         <div className="p-2 bg-gray-50 rounded text-xs text-gray-700 border border-gray-200 whitespace-pre-wrap max-h-40 overflow-y-auto">
