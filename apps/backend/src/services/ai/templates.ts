@@ -3,10 +3,20 @@ import { ObjectType } from '@whiteboard/shared-types';
 import type { BoardObject } from '@whiteboard/shared-types';
 import type { ToolAction, PendingOperation } from './tools.js';
 
+export interface TemplateRegion {
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+}
+
 interface TemplateResult {
   message: string;
   actions: ToolAction[];
   operations: PendingOperation[];
+  regions?: TemplateRegion[];
 }
 
 function makeObj(
@@ -32,6 +42,7 @@ function makeObj(
 // ─── SWOT Analysis ───
 function buildSWOT(userId: string, x = 100, y = 100): TemplateResult {
   const ops: PendingOperation[] = [];
+  const regions: TemplateRegion[] = [];
   const qW = 250, qH = 200, gap = 20, titleH = 35;
   const quadrants = [
     { label: 'Strengths', color: '#DCFCE7', col: 0, row: 0 },
@@ -50,17 +61,20 @@ function buildSWOT(userId: string, x = 100, y = 100): TemplateResult {
       type: 'create',
       object: makeObj({ type: ObjectType.RECTANGLE, position: { x: qx, y: qy + titleH }, width: qW, height: qH, color: q.color }, userId),
     });
+    regions.push({ label: q.label, x: qx, y: qy + titleH, width: qW, height: qH, color: q.color });
   }
   return {
     message: 'Created SWOT analysis with 4 quadrants (Strengths, Weaknesses, Opportunities, Threats).',
     actions: [{ tool: 'template:swot', description: 'Created SWOT analysis (4 quadrants)' }],
     operations: ops,
+    regions,
   };
 }
 
 // ─── Kanban Board ───
 function buildKanban(userId: string, x = 50, y = 80): TemplateResult {
   const ops: PendingOperation[] = [];
+  const regions: TemplateRegion[] = [];
   const colW = 220, colH = 400, gap = 20, titleH = 35;
   const columns = [
     { label: 'To Do', color: '#FEE2E2' },
@@ -78,11 +92,13 @@ function buildKanban(userId: string, x = 50, y = 80): TemplateResult {
       type: 'create',
       object: makeObj({ type: ObjectType.RECTANGLE, position: { x: cx, y: y + titleH }, width: colW, height: colH, color: columns[i].color }, userId),
     });
+    regions.push({ label: columns[i].label, x: cx, y: y + titleH, width: colW, height: colH, color: columns[i].color });
   }
   return {
     message: 'Created Kanban board with 4 columns: To Do, In Progress, Review, Done.',
     actions: [{ tool: 'template:kanban', description: 'Created Kanban board (4 columns)' }],
     operations: ops,
+    regions,
   };
 }
 
@@ -127,6 +143,7 @@ function buildBrainstorm(userId: string, topic?: string, x = 100, y = 100): Temp
 // ─── Pros and Cons ───
 function buildProsCons(userId: string, x = 100, y = 100): TemplateResult {
   const ops: PendingOperation[] = [];
+  const regions: TemplateRegion[] = [];
   const colW = 250, colH = 300, gap = 30, titleH = 35;
 
   // Pros column
@@ -138,6 +155,7 @@ function buildProsCons(userId: string, x = 100, y = 100): TemplateResult {
     type: 'create',
     object: makeObj({ type: ObjectType.RECTANGLE, position: { x, y: y + titleH }, width: colW, height: colH, color: '#DCFCE7' }, userId),
   });
+  regions.push({ label: 'Pros', x, y: y + titleH, width: colW, height: colH, color: '#DCFCE7' });
 
   // Cons column
   ops.push({
@@ -148,11 +166,13 @@ function buildProsCons(userId: string, x = 100, y = 100): TemplateResult {
     type: 'create',
     object: makeObj({ type: ObjectType.RECTANGLE, position: { x: x + colW + gap, y: y + titleH }, width: colW, height: colH, color: '#FEE2E2' }, userId),
   });
+  regions.push({ label: 'Cons', x: x + colW + gap, y: y + titleH, width: colW, height: colH, color: '#FEE2E2' });
 
   return {
     message: 'Created Pros and Cons comparison layout.',
     actions: [{ tool: 'template:proscons', description: 'Created Pros/Cons comparison' }],
     operations: ops,
+    regions,
   };
 }
 
@@ -194,6 +214,7 @@ function buildTimeline(userId: string, x = 50, y = 250): TemplateResult {
 // ─── Eisenhower Matrix ───
 function buildEisenhower(userId: string, x = 100, y = 100): TemplateResult {
   const ops: PendingOperation[] = [];
+  const regions: TemplateRegion[] = [];
   const qW = 250, qH = 200, gap = 20, titleH = 35;
   const quadrants = [
     { label: 'Urgent & Important', color: '#FEE2E2', col: 0, row: 0 },
@@ -212,11 +233,13 @@ function buildEisenhower(userId: string, x = 100, y = 100): TemplateResult {
       type: 'create',
       object: makeObj({ type: ObjectType.RECTANGLE, position: { x: qx, y: qy + titleH }, width: qW, height: qH, color: q.color }, userId),
     });
+    regions.push({ label: q.label, x: qx, y: qy + titleH, width: qW, height: qH, color: q.color });
   }
   return {
     message: 'Created Eisenhower Matrix (Urgent/Important priority grid).',
     actions: [{ tool: 'template:eisenhower', description: 'Created Eisenhower Matrix (4 quadrants)' }],
     operations: ops,
+    regions,
   };
 }
 
@@ -279,12 +302,12 @@ export function tryTemplateMatch(
   command: string,
   boardId: string,
   userId: string,
-): { success: true; result: { message: string; boardId: string; actions: ToolAction[]; operations: PendingOperation[] } } | null {
+): { success: true; result: { message: string; boardId: string; actions: ToolAction[]; operations: PendingOperation[]; regions?: TemplateRegion[] } } | null {
   for (const { pattern, builder } of TEMPLATE_MATCHERS) {
     if (pattern.test(command)) {
-      // Extract a topic for brainstorm: "brainstorm about X" → X
+      // Extract topic: "SWOT analysis for my coffee shop" → "my coffee shop"
       let topic: string | undefined;
-      const topicMatch = command.match(/brain\s*storm\s+(?:about\s+|on\s+|for\s+)?(.+)/i);
+      const topicMatch = command.match(/(?:for|about|on|of)\s+(.+)/i);
       if (topicMatch) topic = topicMatch[1].trim();
 
       const result = builder(userId, topic);

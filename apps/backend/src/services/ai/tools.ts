@@ -434,8 +434,21 @@ export function createWhiteboardTools(
   );
 
   // --- Tool 11: createMultipleObjects (batch) ---
+  // Schema extracted to a const to avoid TS2589 (excessive type depth)
+  const batchObjectSchema = z.object({
+    type: z.enum(['sticky_note', 'rectangle', 'circle', 'text_box', 'arrow']).describe('Object type'),
+    x: z.number().describe('X position'),
+    y: z.number().describe('Y position'),
+    width: z.number().optional().describe('Width (default 150)'),
+    height: z.number().optional().describe('Height (default 100)'),
+    content: z.string().optional().describe('Text content'),
+    color: z.string().optional().describe('Color hex (default #FEF3C7)'),
+    fontSize: z.number().optional().describe('Font size for text_box'),
+  });
+
   const createMultipleObjects = tool(
-    async ({ objects: objDefs }) => {
+    async (input: { objects: z.infer<typeof batchObjectSchema>[] }) => {
+      const objDefs = input.objects;
       const createdIds: string[] = [];
       for (const def of objDefs) {
         const id = uuidv4();
@@ -475,16 +488,60 @@ export function createWhiteboardTools(
       description:
         'Create multiple objects at once in a single batch call. Much faster than creating them one by one. Use this when you need to create 2+ objects.',
       schema: z.object({
-        objects: z.array(z.object({
-          type: z.enum(['sticky_note', 'rectangle', 'circle', 'text_box', 'arrow']).describe('Object type'),
-          x: z.number().describe('X position'),
-          y: z.number().describe('Y position'),
-          width: z.number().optional().describe('Width (default 150)'),
-          height: z.number().optional().describe('Height (default 100)'),
-          content: z.string().optional().describe('Text content'),
-          color: z.string().optional().describe('Color hex (default #FEF3C7)'),
-          fontSize: z.number().optional().describe('Font size for text_box'),
-        })).describe('Array of objects to create'),
+        objects: z.array(batchObjectSchema).describe('Array of objects to create'),
+      }),
+    },
+  );
+
+  // --- Tool 12: populateRegion ---
+  // Places multiple labelled sticky notes inside a rectangular area
+  const populateRegion = tool(
+    async ({ regionX, regionY, regionWidth, regionHeight, items, color }) => {
+      const noteW = 120;
+      const noteH = 60;
+      const pad = 10;
+      const cols = Math.max(1, Math.floor((regionWidth - pad) / (noteW + pad)));
+      const createdIds: string[] = [];
+
+      for (let i = 0; i < items.length; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const nx = regionX + pad + col * (noteW + pad);
+        const ny = regionY + pad + row * (noteH + pad);
+        const id = uuidv4();
+        const obj: BoardObject = {
+          id,
+          type: ObjectType.STICKY_NOTE,
+          position: { x: nx, y: ny },
+          width: noteW,
+          height: noteH,
+          rotation: 0,
+          content: items[i],
+          color: color || '#FEF3C7',
+          userId,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        pendingOps.push({ type: 'create', object: obj });
+        createdIds.push(id);
+      }
+      actions.push({
+        tool: 'populateRegion',
+        description: `Populated region with ${items.length} items`,
+      });
+      return JSON.stringify({ success: true, count: items.length, objectIds: createdIds });
+    },
+    {
+      name: 'populateRegion',
+      description:
+        'Fill a rectangular region with labelled sticky notes. Use this to add content items inside template quadrants, columns, or sections. Provide the region bounds and an array of text items.',
+      schema: z.object({
+        regionX: z.number().describe('X position of the region\'s top-left corner'),
+        regionY: z.number().describe('Y position of the region\'s top-left corner'),
+        regionWidth: z.number().describe('Width of the region in pixels'),
+        regionHeight: z.number().describe('Height of the region in pixels'),
+        items: z.array(z.string()).describe('Array of text labels for the sticky notes'),
+        color: z.string().optional().describe('Sticky note color (hex). Matches the region color by default.'),
       }),
     },
   );
@@ -501,6 +558,7 @@ export function createWhiteboardTools(
     getBoardState,
     createSWOTAnalysis,
     createMultipleObjects,
+    populateRegion,
   ];
 
   return { tools: allTools, actions, pendingOps };

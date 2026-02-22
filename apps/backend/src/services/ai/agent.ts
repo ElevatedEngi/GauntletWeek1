@@ -8,6 +8,9 @@ import type { BaseMessage } from '@langchain/core/messages';
 import { createWhiteboardTools } from './tools.js';
 import type { ToolAction, PendingOperation } from './tools.js';
 import { tryTemplateMatch } from './templates.js';
+import type { TemplateRegion } from './templates.js';
+import { v4 as uuidv4 } from 'uuid';
+import { ObjectType } from '@whiteboard/shared-types';
 import type { BoardObject } from '@whiteboard/shared-types';
 
 interface AICommandResponse {
@@ -35,10 +38,17 @@ CRITICAL FOR SPEED:
 - When creating multiple objects, prefer the createMultipleObjects batch tool — it creates many objects in a single call.
 - Use createSWOTAnalysis, createMultipleObjects, or other composite tools whenever applicable to minimize round-trips.
 
+CONTENT GENERATION:
+- When creating templates (SWOT, Kanban, etc.) or any grouped layout, ALWAYS generate relevant text content for the items inside.
+- Use the populateRegion tool to fill rectangular sections with topical sticky notes. For example, a SWOT analysis about "Tesla" should have sticky notes like "Strong brand recognition" in the Strengths quadrant.
+- If the user mentions a topic (e.g., "SWOT analysis for my coffee shop"), generate 2-4 specific, relevant items per section.
+- If no topic is specified, generate generic placeholder items that demonstrate the template's purpose (e.g., "Team expertise" for Strengths).
+- When creating sticky notes or text boxes, always include meaningful content text — never leave objects empty.
+
 Guidelines:
 - For positioning: The canvas uses pixel coordinates starting at (0,0) top-left. Use positions in the 100-800 range for x and 100-600 range for y. Space objects at least 170px apart horizontally and 120px apart vertically.
 - For colors: Use pastel hex colors. Common options: yellow #FEF3C7, red #FEE2E2, green #DCFCE7, blue #DBEAFE, purple #E9D5FF, gray #F3F4F6
-- When asked to do a SWOT analysis, use the createSWOTAnalysis tool.
+- When asked to do a SWOT analysis, use the createSWOTAnalysis tool, then IMMEDIATELY follow up by using populateRegion to fill each quadrant with relevant content.
 - When you need context about what's on the board, call getBoardState first.
 - After performing actions, give a brief summary of what you did.`;
 
@@ -76,6 +86,20 @@ export class AIAgent {
     const templateResult = tryTemplateMatch(command, boardId, userId);
     if (templateResult) {
       console.log(`[AI] Template fast-path matched for: "${command}"`);
+      const regions = templateResult.result.regions;
+      if (regions && regions.length > 0) {
+        // Generate content for each region using a fast LLM call
+        try {
+          const contentOps = await this.generateRegionContent(command, regions, userId);
+          templateResult.result.operations.push(...contentOps);
+          templateResult.result.actions.push({
+            tool: 'ai:fillContent',
+            description: `Generated content for ${regions.length} regions`,
+          });
+        } catch (err) {
+          console.warn('[AI] Content generation failed, returning empty template:', err);
+        }
+      }
       return templateResult;
     }
 
@@ -225,6 +249,77 @@ export class AIAgent {
       };
     }
   }
+  async generateRegionContent(
+    command: string,
+    regions: TemplateRegion[],
+    userId: string,
+  ): Promise<PendingOperation[]> {
+    const model = this.getModel();
+    const contentModel = new ChatAnthropic({
+      modelName: 'claude-sonnet-4-20250514',
+      anthropicApiKey: model.apiKey as string,
+      maxTokens: 1024,
+      temperature: 0.5,
+    });
+
+    const regionList = regions.map((r) => r.label).join(', ');
+    const response = await contentModel.invoke([
+      new SystemMessage(
+        `You generate content for whiteboard template regions. Return ONLY valid JSON — no markdown, no code fences, no explanation.
+
+The user's command: "${command}"
+The template has these regions: ${regionList}
+
+Return a JSON object where each key is a region label and the value is an array of 2-4 short text items (max 6 words each) relevant to that region and the user's topic.
+
+Example for a SWOT about "coffee shop":
+{"Strengths":["Prime downtown location","Loyal customer base","Unique recipes"],"Weaknesses":["High rent costs","Limited seating"],"Opportunities":["Catering services","Online ordering"],"Threats":["New competitor nearby","Rising bean prices"]}`
+      ),
+      new HumanMessage(command),
+    ]);
+
+    const raw = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+    // Strip markdown fences if present
+    const cleaned = raw.replace(/```(?:json)?\s*/g, '').replace(/```\s*/g, '').trim();
+    const contentMap: Record<string, string[]> = JSON.parse(cleaned);
+
+    const ops: PendingOperation[] = [];
+    for (const region of regions) {
+      const items = contentMap[region.label];
+      if (!items || !Array.isArray(items)) continue;
+
+      const noteW = 120;
+      const noteH = 55;
+      const pad = 8;
+      const cols = Math.max(1, Math.floor((region.width - pad) / (noteW + pad)));
+
+      for (let i = 0; i < items.length; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        ops.push({
+          type: 'create',
+          object: {
+            id: uuidv4(),
+            type: ObjectType.STICKY_NOTE,
+            position: {
+              x: region.x + pad + col * (noteW + pad),
+              y: region.y + pad + row * (noteH + pad),
+            },
+            width: noteW,
+            height: noteH,
+            rotation: 0,
+            content: items[i],
+            color: region.color,
+            userId,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          },
+        });
+      }
+    }
+    return ops;
+  }
+
   async previewCommand(
     command: string,
     boardId: string,
